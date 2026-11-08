@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/nucleo", "crates/vigia", "crates/painel"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+# Binário pequeno: o vigia fica rodando o tempo todo.
+lto = true
+codegen-units = 1
+strip = true
+# Nunca usar panic = "abort": as guardas RAII do modo jogo (Fase 2)
+# precisam rodar o Drop quando acontece um panic.

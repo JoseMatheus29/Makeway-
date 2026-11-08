@@ -1,0 +1,11 @@
+[package]
+name = "vigia"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nucleo = { version = "0.1.0", path = "../nucleo" }
+
+[[bin]]
+name = "makeway-vigia"
+path = "src/main.rs"

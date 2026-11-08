@@ -1,0 +1,64 @@
+# Configuração do Makeway.
+#
+# O vigia e o painel leem este mesmo arquivo. Toda opção tem um valor
+# padrão: apagar uma linha (ou o arquivo inteiro) volta ao padrão.
+# Um nome de opção escrito errado é recusado com uma mensagem de erro,
+# em vez de ser ignorado em silêncio.
+
+[ram]
+# Quantos apps mostrar no comando `makeway ram`, do que mais usa RAM
+# para o que menos usa. O resto aparece somado numa linha "Outros".
+top_apps = 15
+
+[disco]
+# Quantos níveis de subpastas mostrar no `makeway disco`.
+profundidade = 2
+# Quantas pastas mostrar em cada nível e quantos arquivos na lista dos maiores.
+top = 10
+# O `makeway duplicados` ignora arquivos menores que isso, em MB.
+duplicados_min_mb = 1
+
+[temporarios]
+# Só vão para a Lixeira itens criados E alterados há mais de N dias.
+idade_minima_dias = 2
+
+[modo_jogo]
+# Liga ou desliga o modo jogo. Desligado, o vigia não faz nada.
+ativo = true
+# "observar": só grava um relatório de cada partida, sem mudar nada.
+# "otimizar": aplica o que está abaixo e desfaz tudo quando o jogo fecha.
+# Comece observando umas 3 partidas e monte as listas pelos relatórios.
+modo = "observar"
+# Nome do .exe dos seus jogos (Gerenciador de Tarefas > Detalhes, com o
+# jogo aberto). Exemplo: ["VALORANT-Win64-Shipping.exe", "Overwatch.exe"]
+jogos = []
+# Também conta como jogo o maior processo (100 MB ou mais) aberto de dentro
+# de uma destas pastas. Launchers e ajudantes conhecidos ficam de fora.
+detectar_pelas_pastas = true
+pastas_de_jogos = [
+    '\steamapps\common\',
+    '\Epic Games\',
+    '\Riot Games\',
+    '\XboxGames\',
+    '\Ubisoft Game Launcher\games\',
+    '\EA Games\',
+    '\GOG Galaxy\Games\',
+]
+# .exe que nunca contam como jogo, além dos launchers que o Makeway já conhece.
+ignorar = []
+# De quantos em quantos segundos procurar o jogo e anotar a memória.
+intervalo_segundos = 3
+# Prioridade do jogo durante a partida: "normal", "acima_do_normal" ou "alta".
+# "Tempo real" não existe aqui porque pode travar o mouse e o teclado.
+prioridade = "alta"
+# Troca para o plano de energia Alto desempenho durante o jogo...
+plano_alto_desempenho = true
+# ...mas não quando o notebook está na bateria.
+plano_somente_na_tomada = true
+# Apps pausados enquanto o jogo roda e retomados quando ele fecha. A RAM
+# deles volta para o sistema. Exemplo: ["OneDrive.exe", "Docker Desktop.exe"]
+# Um app pausado não faz nada: nem a voz do Discord nem um download.
+pausar = []
+# Apps fechados quando o jogo abre, como se você clicasse no X.
+# Eles não reabrem sozinhos no fim.
+fechar = []

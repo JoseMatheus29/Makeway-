@@ -11,7 +11,7 @@ use std::io;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -73,9 +73,19 @@ pub struct Contadores {
     exemplos: Mutex<Vec<PathBuf>>,
     nuvem_arquivos: AtomicU64,
     nuvem_bytes: AtomicU64,
+    cancelado: AtomicBool,
 }
 
 impl Contadores {
+    /// Pede para a varredura parar. O que já foi lido fica no resultado.
+    pub fn cancelar(&self) {
+        self.cancelado.store(true, Ordering::Relaxed);
+    }
+
+    pub fn cancelado(&self) -> bool {
+        self.cancelado.load(Ordering::Relaxed)
+    }
+
     pub fn arquivos_vistos(&self) -> u64 {
         self.arquivos.load(Ordering::Relaxed)
     }
@@ -131,6 +141,8 @@ pub struct Varredura {
     pub maiores_arquivos: Vec<Arquivo>,
     pub pulados: Pulados,
     pub segundos: f64,
+    /// Parou no meio a pedido do usuário: os números estão incompletos.
+    pub cancelada: bool,
 }
 
 /// Varre `raiz` inteira. `profundidade` = quantos níveis de subpastas
@@ -144,6 +156,7 @@ pub fn varrer(raiz: &Path, profundidade: usize, top_arquivos: usize, c: &Contado
         maiores_arquivos: maiores.em_ordem(),
         pulados: c.pulados(),
         segundos: inicio.elapsed().as_secs_f64(),
+        cancelada: c.cancelado(),
     }
 }
 
@@ -155,6 +168,9 @@ fn varrer_pasta(
     c: &Contadores,
 ) -> Pasta {
     let mut pasta = Pasta { caminho, tamanho: 0, arquivos: 0, subpastas: 0, filhos: Vec::new() };
+    if c.cancelado() {
+        return pasta;
+    }
     let leitura = match fs::read_dir(&pasta.caminho) {
         Ok(leitura) => leitura,
         Err(_) => {
@@ -196,6 +212,9 @@ fn varrer_pasta(
 
 /// Lista de todos os arquivos locais com pelo menos `minimo` bytes.
 pub(crate) fn listar_arquivos(raiz: &Path, minimo: u64, c: &Contadores) -> Vec<(PathBuf, u64)> {
+    if c.cancelado() {
+        return Vec::new();
+    }
     let mut lista = Vec::new();
     let leitura = match fs::read_dir(raiz) {
         Ok(leitura) => leitura,

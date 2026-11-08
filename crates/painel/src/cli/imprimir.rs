@@ -205,7 +205,7 @@ pub fn temporarios(a: &AnaliseTemporarios, vai_apagar: bool) {
     }
     if !vai_apagar && !a.antigos.is_empty() {
         println!();
-        println!("Nada foi apagado. Para mandar para a Lixeira: makeway temporarios --apagar");
+        println!("Nada foi apagado. Para mandar para a Lixeira: makeway-cli temporarios --apagar");
     }
 }
 
@@ -261,7 +261,7 @@ pub fn sessoes(pasta: &Path, relatorios: &[(PathBuf, RelatorioSessao)]) {
         );
     }
     println!();
-    println!("Detalhes de uma partida: makeway sessoes 1");
+    println!("Detalhes de uma partida: makeway-cli sessoes 1");
 }
 
 pub fn sessao(arquivo: &Path, r: &RelatorioSessao) {

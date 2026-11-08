@@ -15,6 +15,7 @@ use std::mem::{offset_of, size_of};
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ntapi::ntexapi::{
@@ -30,7 +31,10 @@ use windows::Win32::Foundation::{
     LocalFree, WPARAM,
 };
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
-use windows::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
+use windows::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, GetDiskFreeSpaceExW, GetFileInformationByHandle, GetFileVersionInfoSizeW,
+    GetFileVersionInfoW, VerQueryValueW,
+};
 use windows::Win32::System::Console::{
     CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, SetConsoleCtrlHandler,
 };
@@ -50,11 +54,18 @@ use windows::Win32::System::Threading::{
     PROCESS_SUSPEND_RESUME, QueryFullProcessImageNameW, SYNCHRONIZATION_SYNCHRONIZE,
     SetPriorityClass,
 };
+use windows::Win32::Foundation::LRESULT;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{GetCurrentThreadId, GetExitCodeProcess, INFINITE, WaitForSingleObject};
+use windows::Win32::UI::Shell::{SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GetWindow, GetWindowThreadProcessId, IsWindowVisible, PostMessageW,
-    WM_CLOSE,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, EnumWindows, FindWindowW, GW_OWNER,
+    GetMessageW, GetWindow, GetWindowThreadProcessId, IsWindowVisible, MSG, PostMessageW,
+    PostThreadMessageW, RegisterClassW, SW_HIDE, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_ENDSESSION,
+    WM_QUERYENDSESSION, WM_QUIT, WNDCLASSW,
 };
-use windows::core::{BOOL, GUID, HSTRING, PWSTR};
+use windows::core::{BOOL, GUID, HSTRING, PCWSTR, PWSTR, w};
 
 use crate::ram::{ArquivoPaginacao, ListasMemoria, MemoriaSistema, Processo};
 
@@ -337,6 +348,173 @@ pub fn e_administrador() -> bool {
 
 static PEDIU_PARA_SAIR: AtomicBool = AtomicBool::new(false);
 static LIMPEZA_FEITA: AtomicBool = AtomicBool::new(false);
+static DESPERTADOR: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+/// A flag que o Ctrl+C, o "Sair" do ícone e o desligamento do Windows ligam.
+pub fn pedido_de_saida() -> &'static AtomicBool {
+    &PEDIU_PARA_SAIR
+}
+
+/// Pede para o programa sair e acorda quem estiver esperando.
+pub fn pedir_saida() {
+    PEDIU_PARA_SAIR.store(true, Ordering::SeqCst);
+    if let Some(despertar) = DESPERTADOR.get() {
+        despertar();
+    }
+}
+
+/// O que chamar para acordar o loop principal quando pedirem para sair.
+pub fn definir_despertador(despertar: impl Fn() + Send + Sync + 'static) {
+    let _ = DESPERTADOR.set(Box::new(despertar));
+}
+
+/// Segura o desligamento do Windows até a limpeza acabar (no máximo 4,5 s,
+/// porque depois disso o Windows mata o processo de qualquer jeito).
+fn esperar_limpeza() {
+    let inicio = std::time::Instant::now();
+    while !LIMPEZA_FEITA.load(Ordering::SeqCst) && inicio.elapsed().as_millis() < 4500 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+pub fn id_da_thread() -> u32 {
+    // SAFETY: sem parâmetros.
+    unsafe { GetCurrentThreadId() }
+}
+
+/// Manda `WM_APP + codigo` para o loop de mensagens de outra thread.
+pub fn avisar_thread(thread: u32, codigo: u32) {
+    // SAFETY: mensagem sem ponteiros.
+    let _ = unsafe { PostThreadMessageW(thread, WM_APP + codigo, WPARAM(0), LPARAM(0)) };
+}
+
+/// Faz o `loop_de_mensagens` daquela thread terminar.
+pub fn encerrar_loop(thread: u32) {
+    // SAFETY: mensagem sem ponteiros.
+    let _ = unsafe { PostThreadMessageW(thread, WM_QUIT, WPARAM(0), LPARAM(0)) };
+}
+
+/// Loop de mensagens do Windows; o ícone perto do relógio precisa dele.
+/// Mensagens `WM_APP + n` mandadas por `avisar_thread` chegam em `ao_aviso(n)`.
+pub fn loop_de_mensagens(mut ao_aviso: impl FnMut(u32)) {
+    let mut msg = MSG::default();
+    // SAFETY: `msg` é gravável; GetMessage devolve 0 no WM_QUIT e -1 em erro.
+    while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
+        if msg.hwnd.0.is_null() && (WM_APP..0xC000).contains(&msg.message) {
+            ao_aviso(msg.message - WM_APP);
+            continue;
+        }
+        // `taskkill` sem /F posta WM_CLOSE em só uma das janelas (às vezes a
+        // do ícone, que sumiria com o programa ainda rodando). Qualquer
+        // WM_CLOSE postado vira um pedido de saída educado.
+        if msg.message == WM_CLOSE {
+            pedir_saida();
+            continue;
+        }
+        // SAFETY: mensagem recebida agora do GetMessage.
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+/// Janela invisível que recebe o aviso de logoff/desligamento. Sem ela, um
+/// programa sem console seria morto sem chance de desfazer o modo jogo.
+pub fn criar_janela_de_encerramento() -> io::Result<()> {
+    unsafe extern "system" fn ao_mensagem(janela: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        match msg {
+            WM_QUERYENDSESSION => LRESULT(1),
+            // `taskkill` sem /F manda WM_CLOSE: sai do jeito educado, desfazendo tudo.
+            WM_CLOSE => {
+                pedir_saida();
+                LRESULT(0)
+            }
+            WM_ENDSESSION => {
+                if w.0 != 0 {
+                    pedir_saida();
+                    esperar_limpeza();
+                }
+                LRESULT(0)
+            }
+            // SAFETY: repassa o resto para o tratamento padrão.
+            _ => unsafe { DefWindowProcW(janela, msg, w, l) },
+        }
+    }
+    let classe = w!("MakewayEncerramento");
+    // SAFETY: módulo do próprio executável.
+    let instancia = unsafe { GetModuleHandleW(PCWSTR::null()) }.map_err(io::Error::from)?;
+    let registro = WNDCLASSW {
+        lpfnWndProc: Some(ao_mensagem),
+        hInstance: instancia.into(),
+        lpszClassName: classe,
+        ..Default::default()
+    };
+    // SAFETY: struct preenchida acima; o nome da classe é estático.
+    unsafe { RegisterClassW(&registro) };
+    // SAFETY: janela de nível superior, nunca mostrada (não recebe foco nem aparece na barra).
+    unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            classe,
+            w!("Makeway (vigia, oculta)"),
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            Some(instancia.into()),
+            None,
+        )
+    }
+    .map(|_| ())
+    .map_err(io::Error::from)
+}
+
+/// Mostra e põe na frente a janela com esse título. `false` se não achar.
+pub fn trazer_para_frente(titulo: &str) -> bool {
+    let titulo = HSTRING::from(titulo);
+    // SAFETY: título válido.
+    let Ok(janela) = (unsafe { FindWindowW(PCWSTR::null(), &titulo) }) else { return false };
+    // SAFETY: janela devolvida pelo FindWindow.
+    unsafe {
+        let _ = ShowWindow(janela, SW_RESTORE);
+        let _ = SetForegroundWindow(janela);
+    }
+    true
+}
+
+/// Roda um programa com administrador (abre o aviso do UAC), espera ele
+/// terminar e devolve o código de saída. Se o usuário recusar o UAC, dá erro.
+pub fn executar_como_admin(programa: &str, argumentos: &str) -> io::Result<u32> {
+    let verbo = HSTRING::from("runas");
+    let arquivo = HSTRING::from(programa);
+    let parametros = HSTRING::from(argumentos);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+        lpVerb: PCWSTR(verbo.as_ptr()),
+        lpFile: PCWSTR(arquivo.as_ptr()),
+        lpParameters: PCWSTR(parametros.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+    // SAFETY: as strings vivem até o fim da função.
+    unsafe { ShellExecuteExW(&mut info) }.map_err(io::Error::from)?;
+    if info.hProcess.is_invalid() {
+        return Err(io::Error::other("o Windows não devolveu o processo"));
+    }
+    let processo = Handle(info.hProcess);
+    let mut codigo = 0;
+    // SAFETY: handle do processo criado acima.
+    unsafe {
+        WaitForSingleObject(processo.0, INFINITE);
+        GetExitCodeProcess(processo.0, &mut codigo).map_err(io::Error::from)?;
+    }
+    Ok(codigo)
+}
 
 /// Troca o "mata na hora" do Ctrl+C e do X da janela do console por um
 /// pedido educado: liga a flag devolvida, e o programa sai do loop e
@@ -344,12 +522,9 @@ static LIMPEZA_FEITA: AtomicBool = AtomicBool::new(false);
 /// o handler segura até `avisar_limpeza_feita` ou 4,5 s.
 pub fn tratar_ctrl_c() -> &'static AtomicBool {
     unsafe extern "system" fn ao_sinal(tipo: u32) -> BOOL {
-        PEDIU_PARA_SAIR.store(true, Ordering::SeqCst);
+        pedir_saida();
         if matches!(tipo, CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT) {
-            let inicio = std::time::Instant::now();
-            while !LIMPEZA_FEITA.load(Ordering::SeqCst) && inicio.elapsed().as_millis() < 4500 {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+            esperar_limpeza();
         }
         true.into()
     }
@@ -420,6 +595,66 @@ pub fn identidade_arquivo(arquivo: &File) -> io::Result<(u32, u64)> {
         .map_err(io::Error::from)?;
     let indice = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
     Ok((info.dwVolumeSerialNumber, indice))
+}
+
+/// Primeiro nome da conta do Windows ("Matheus"), se a conta tiver um.
+pub fn primeiro_nome() -> Option<String> {
+    use windows::Win32::Security::Authentication::Identity::{GetUserNameExW, NameDisplay};
+    let mut texto = vec![0u16; 256];
+    let mut tamanho = texto.len() as u32;
+    // SAFETY: buffer gravável com `tamanho` caracteres.
+    if !unsafe { GetUserNameExW(NameDisplay, Some(PWSTR(texto.as_mut_ptr())), &mut tamanho) } {
+        return None;
+    }
+    let nome = String::from_utf16_lossy(&texto[..tamanho as usize]);
+    nome.split_whitespace().next().map(str::to_owned)
+}
+
+/// (livre, total) em bytes da unidade onde `caminho` está.
+pub fn espaco_no_disco(caminho: &std::path::Path) -> io::Result<(u64, u64)> {
+    let nome = HSTRING::from(caminho.to_string_lossy().as_ref());
+    let (mut livre, mut total) = (0u64, 0u64);
+    // SAFETY: ponteiros para u64 graváveis.
+    unsafe { GetDiskFreeSpaceExW(&nome, Some(&mut livre), Some(&mut total), None) }.map_err(io::Error::from)?;
+    Ok((livre, total))
+}
+
+/// A "Descrição do arquivo" gravada no .exe (a mesma que o Gerenciador de
+/// Tarefas mostra), por exemplo "Opera GX Internet Browser".
+pub fn descricao_do_executavel(caminho: &std::path::Path) -> Option<String> {
+    let nome = HSTRING::from(caminho.to_string_lossy().as_ref());
+    // SAFETY: nome válido.
+    let tamanho = unsafe { GetFileVersionInfoSizeW(&nome, None) };
+    if tamanho == 0 {
+        return None;
+    }
+    let mut dados = vec![0u8; tamanho as usize];
+    // SAFETY: buffer com `tamanho` bytes graváveis.
+    unsafe { GetFileVersionInfoW(&nome, None, tamanho, dados.as_mut_ptr().cast()) }.ok()?;
+    let mut ponteiro: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut comprimento = 0u32;
+    // Idioma e página de código da primeira tradução; senão, inglês/Unicode.
+    // SAFETY: `dados` vive até o fim; o ponteiro devolvido aponta para dentro dele.
+    let (idioma, pagina) = unsafe {
+        if VerQueryValueW(dados.as_ptr().cast(), w!("\\VarFileInfo\\Translation"), &mut ponteiro, &mut comprimento).as_bool()
+            && comprimento >= 4
+        {
+            let p = ponteiro as *const u16;
+            (*p, *p.add(1))
+        } else {
+            (0x0409, 0x04B0)
+        }
+    };
+    let chave = HSTRING::from(format!("\\StringFileInfo\\{idioma:04x}{pagina:04x}\\FileDescription"));
+    // SAFETY: idem.
+    let achou = unsafe { VerQueryValueW(dados.as_ptr().cast(), &chave, &mut ponteiro, &mut comprimento) };
+    if !achou.as_bool() || comprimento == 0 || ponteiro.is_null() {
+        return None;
+    }
+    // SAFETY: `comprimento` caracteres UTF-16 dentro de `dados`.
+    let unidades = unsafe { std::slice::from_raw_parts(ponteiro as *const u16, comprimento as usize) };
+    let texto = String::from_utf16_lossy(unidades).trim_end_matches('\0').trim().to_owned();
+    (!texto.is_empty()).then_some(texto)
 }
 
 /// Chama `NtQuerySystemInformation`, aumentando o buffer até caber.

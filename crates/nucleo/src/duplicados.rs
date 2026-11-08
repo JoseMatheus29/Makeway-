@@ -44,6 +44,7 @@ pub struct ResultadoDuplicados {
     /// Arquivos que não deu para abrir (em uso com trava exclusiva, sem permissão).
     pub nao_lidos: u64,
     pub segundos: f64,
+    pub cancelada: bool,
 }
 
 pub fn procurar(raiz: &Path, tamanho_minimo: u64, c: &Contadores) -> ResultadoDuplicados {
@@ -62,7 +63,7 @@ pub fn procurar(raiz: &Path, tamanho_minimo: u64, c: &Contadores) -> ResultadoDu
 
     let mut grupos: Vec<GrupoDuplicado> = candidatos
         .into_par_iter()
-        .flat_map_iter(|(tamanho, caminhos)| comparar_grupo(tamanho, caminhos, &estatisticas))
+        .flat_map_iter(|(tamanho, caminhos)| comparar_grupo(tamanho, caminhos, &estatisticas, c))
         .collect();
     grupos.sort_by(|a, b| b.desperdicio.cmp(&a.desperdicio).then_with(|| a.arquivos.cmp(&b.arquivos)));
 
@@ -74,6 +75,7 @@ pub fn procurar(raiz: &Path, tamanho_minimo: u64, c: &Contadores) -> ResultadoDu
         pulados: c.pulados(),
         nao_lidos: estatisticas.nao_lidos.load(Ordering::Relaxed),
         segundos: inicio.elapsed().as_secs_f64(),
+        cancelada: c.cancelado(),
     }
 }
 
@@ -85,7 +87,10 @@ struct Estatisticas {
 }
 
 /// Filtros 2 e 3 para arquivos que já têm o mesmo tamanho.
-fn comparar_grupo(tamanho: u64, caminhos: Vec<PathBuf>, e: &Estatisticas) -> Vec<GrupoDuplicado> {
+fn comparar_grupo(tamanho: u64, caminhos: Vec<PathBuf>, e: &Estatisticas, c: &Contadores) -> Vec<GrupoDuplicado> {
+    if c.cancelado() {
+        return Vec::new();
+    }
     let mut identidades = HashSet::new();
     let mut por_comeco: HashMap<blake3::Hash, Vec<PathBuf>> = HashMap::new();
     for caminho in caminhos {

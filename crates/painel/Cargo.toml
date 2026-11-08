@@ -4,11 +4,19 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.6.7", features = ["derive"] }
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "clipboard"] }
+egui_plot = "0.38.0"
 nucleo = { version = "0.1.0", path = "../nucleo" }
+rfd = "0.18.0"
 serde = "1.0.229"
 serde_json = "1.0.154"
 
 [[bin]]
 name = "makeway"
 path = "src/main.rs"
+
+[[bin]]
+name = "makeway-cli"
+path = "src/cli/main.rs"

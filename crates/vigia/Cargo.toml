@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 nucleo = { version = "0.1.0", path = "../nucleo" }
+tray-icon = "0.26.1"
 
 [[bin]]
 name = "makeway-vigia"

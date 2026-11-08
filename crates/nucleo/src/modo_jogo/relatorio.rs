@@ -286,6 +286,27 @@ pub fn gravar(pasta: &Path, r: &RelatorioSessao, amostras: &[Amostra]) -> io::Re
     Ok(json)
 }
 
+/// Lê de volta as amostras do .csv ao lado de um relatório .json.
+pub fn ler_amostras(json: &Path) -> io::Result<Vec<Amostra>> {
+    let texto = fs::read_to_string(json.with_extension("csv"))?;
+    let mb = |campo: &str| campo.trim().parse::<u64>().unwrap_or(0) << 20;
+    Ok(texto
+        .lines()
+        .skip(1)
+        .filter_map(|linha| {
+            let c: Vec<&str> = linha.split(';').collect();
+            (c.len() >= 6).then(|| Amostra {
+                segundos: c[0].trim().parse().unwrap_or(0.0),
+                ram_disponivel: mb(c[1]),
+                confirmada: mb(c[2]),
+                paginacao_em_uso: mb(c[3]),
+                ram_jogo: mb(c[4]),
+                cpu_jogo_pct: c[5].trim().replace(',', ".").parse().unwrap_or(0.0),
+            })
+        })
+        .collect())
+}
+
 /// Relatórios gravados, do mais novo para o mais antigo.
 pub fn listar(pasta: &Path) -> Vec<(PathBuf, RelatorioSessao)> {
     let Ok(leitura) = fs::read_dir(pasta) else { return Vec::new() };
@@ -365,5 +386,9 @@ mod testes {
         let lidos = listar(&pasta.0);
         assert_eq!(lidos.len(), 1);
         assert_eq!(lidos[0].1.jogo, "Jogo.exe");
+        let de_volta = ler_amostras(&json).unwrap();
+        assert_eq!(de_volta.len(), 3);
+        assert_eq!(de_volta[1].ram_disponivel, 800 << 20);
+        assert_eq!(de_volta[2].paginacao_em_uso, 500 << 20);
     }
 }

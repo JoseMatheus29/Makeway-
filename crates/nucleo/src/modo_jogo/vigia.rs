@@ -1,12 +1,19 @@
 //! O loop do vigia: procura o jogo, abre a sessão, anota amostras e,
 //! quando o jogo fecha, desfaz tudo e grava o relatório.
+//!
+//! Fora do jogo, com administrador, o vigia dorme até o Windows avisar que
+//! um processo abriu (WMI). Sem administrador, olha a lista a cada N s.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime};
 
+use serde::{Deserialize, Serialize};
+
 use super::deteccao::{self, FonteProcessos, Jogo, ProcessosDoWindows};
+use super::eventos;
 use super::protecao::Protecao;
 use super::relatorio::{self, Amostrador};
 use super::sessao::{ALTO_DESEMPENHO, AcoesWindows, Sessao, restaurar_pendente};
@@ -16,6 +23,13 @@ use crate::sistema;
 
 pub const NOME_DO_MUTEX: &str = r"Local\Makeway-Vigia";
 
+/// Com os avisos do Windows ligados, fora do jogo o vigia só olha a lista
+/// por conta própria de tanto em tanto tempo...
+const ESPERA_COM_EVENTOS: u64 = 30;
+/// ...a não ser que algum processo tenha aberto há pouco: jogos detectados
+/// pela pasta só passam de 100 MB depois de alguns segundos carregando.
+const ATENCAO_DEPOIS_DE_ABRIR: Duration = Duration::from_secs(90);
+
 pub fn arquivo_de_estado(pasta_dados: &Path) -> PathBuf {
     pasta_dados.join("estado.json")
 }
@@ -24,9 +38,94 @@ pub fn pasta_de_relatorios(pasta_dados: &Path) -> PathBuf {
     pasta_dados.join("relatorios")
 }
 
+pub fn arquivo_de_status(pasta_dados: &Path) -> PathBuf {
+    pasta_dados.join("status.json")
+}
+
 /// `true` se um vigia está rodando agora.
 pub fn vigia_rodando() -> bool {
     sistema::instancia_rodando(NOME_DO_MUTEX)
+}
+
+/// O que o vigia está fazendo. Vai para o ícone e para o `status.json`,
+/// que o painel lê (os dois não conversam direto).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StatusVigia {
+    pub pid: u32,
+    pub desde_unix: i64,
+    pub ativo: bool,
+    pub modo: Modo,
+    pub administrador: bool,
+    /// Recebe o aviso do Windows a cada processo aberto.
+    pub eventos_do_windows: bool,
+    pub intervalo_segundos: u64,
+    pub jogo: Option<String>,
+    pub jogo_desde_unix: Option<i64>,
+}
+
+/// O status gravado pelo vigia, se houver um vigia rodando.
+pub fn ler_status(pasta_dados: &Path) -> Option<StatusVigia> {
+    if !vigia_rodando() {
+        return None;
+    }
+    serde_json::from_slice(&std::fs::read(arquivo_de_status(pasta_dados)).ok()?).ok()
+}
+
+enum Sinal {
+    Acordar,
+    ProcessoAbriu,
+}
+
+/// Acorda o loop do vigia de outra thread.
+#[derive(Clone)]
+pub struct Despertador(mpsc::Sender<Sinal>);
+
+impl Despertador {
+    /// Olha de novo agora (config mudou, pediram para sair...).
+    pub fn acordar(&self) {
+        let _ = self.0.send(Sinal::Acordar);
+    }
+
+    pub(crate) fn processo_abriu(&self) {
+        let _ = self.0.send(Sinal::ProcessoAbriu);
+    }
+}
+
+/// O lado do loop: espera até o tempo acabar ou alguém acordar.
+pub struct Espera(mpsc::Receiver<Sinal>);
+
+pub fn canal() -> (Despertador, Espera) {
+    let (tx, rx) = mpsc::channel();
+    (Despertador(tx), Espera(rx))
+}
+
+impl Espera {
+    /// Espera até `segundos` (ou até `parar`). Devolve `true` se um
+    /// processo abriu nesse meio-tempo. Com `so_o_tempo`, avisos de
+    /// processo não interrompem (as amostras da partida ficam regulares).
+    fn esperar(&self, segundos: u64, parar: &AtomicBool, so_o_tempo: bool) -> bool {
+        let fim = Instant::now() + Duration::from_secs(segundos.max(1));
+        let mut abriu = false;
+        while !parar.load(Ordering::SeqCst) {
+            let falta = fim.saturating_duration_since(Instant::now());
+            if falta.is_zero() {
+                break;
+            }
+            // Pedaços de no máximo 1 s: o Ctrl+C liga a flag sem acordar.
+            match self.0.recv_timeout(falta.min(Duration::from_secs(1))) {
+                Ok(Sinal::Acordar) => break,
+                Ok(Sinal::ProcessoAbriu) => {
+                    abriu = true;
+                    if !so_o_tempo {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => std::thread::sleep(falta.min(Duration::from_secs(1))),
+            }
+        }
+        abriu
+    }
 }
 
 struct Partida {
@@ -37,8 +136,16 @@ struct Partida {
     avisos: Vec<String>,
 }
 
-/// Roda até `parar` virar `true`. `log` recebe cada linha de registro.
-pub fn rodar(caminho_config: &Path, parar: &AtomicBool, log: &mut dyn FnMut(&str)) {
+/// Roda até `parar` virar `true`. `log` recebe cada linha de registro e
+/// `status` cada mudança de estado.
+pub fn rodar(
+    caminho_config: &Path,
+    parar: &AtomicBool,
+    espera: Espera,
+    despertador: Despertador,
+    log: &mut dyn FnMut(&str),
+    status: &mut dyn FnMut(&StatusVigia),
+) {
     let pasta_dados = config::pasta_dos_dados_de(caminho_config);
     let estado = arquivo_de_estado(&pasta_dados);
 
@@ -57,28 +164,60 @@ pub fn rodar(caminho_config: &Path, parar: &AtomicBool, log: &mut dyn FnMut(&str
     }
 
     let (mut cfg, mut versao_config) = carregar(caminho_config, log);
-    if !sistema::e_administrador() {
+    let administrador = sistema::e_administrador();
+    let eventos_do_windows = administrador
+        && match eventos::assinar(despertador.clone()) {
+            Ok(()) => true,
+            Err(erro) => {
+                log(&format!("sem os avisos do Windows ({erro})"));
+                false
+            }
+        };
+    if !administrador {
         log("rodando sem administrador: apps elevados e alguns jogos não podem ser alterados");
     }
-    log(&format!(
-        "vigiando a cada {} s, modo {} (Ctrl+C para sair)",
-        cfg.modo_jogo.intervalo_segundos,
-        nome_do_modo(cfg.modo_jogo.modo)
-    ));
+    let procura = if eventos_do_windows {
+        "o Windows avisa quando um processo abre".to_owned()
+    } else {
+        format!("procurando o jogo a cada {} s", cfg.modo_jogo.intervalo_segundos)
+    };
+    log(&format!("vigia iniciado, modo {}; {procura}", cfg.modo_jogo.modo.texto()));
+
+    let mut atual = StatusVigia {
+        pid: std::process::id(),
+        desde_unix: chrono::Utc::now().timestamp(),
+        ativo: cfg.modo_jogo.ativo,
+        modo: cfg.modo_jogo.modo,
+        administrador,
+        eventos_do_windows,
+        intervalo_segundos: cfg.modo_jogo.intervalo_segundos,
+        jogo: None,
+        jogo_desde_unix: None,
+    };
+    publicar(&pasta_dados, &atual, status);
 
     let mut fonte = ProcessosDoWindows::default();
     let mut partida: Option<Partida> = None;
+    let mut ultimo_processo_aberto = Some(Instant::now());
     while !parar.load(Ordering::SeqCst) {
-        // Config editado com o vigia aberto: vale a partir da próxima partida.
-        if partida.is_none() && data_do_arquivo(caminho_config) != versao_config {
+        // Config editado com o vigia aberto (painel ou ícone): vale na hora
+        // para ligar/desligar, e na próxima partida para o resto.
+        if data_do_arquivo(caminho_config) != versao_config {
             (cfg, versao_config) = carregar(caminho_config, log);
             log("config recarregado");
+            if !cfg.modo_jogo.ativo
+                && let Some(p) = partida.take()
+            {
+                log("modo jogo desligado com o jogo aberto");
+                let processos = fonte.processos().unwrap_or_default();
+                terminar(p, &cfg, &processos, &pasta_dados, log);
+            }
         }
         let processos = match fonte.processos() {
             Ok(processos) => processos,
             Err(erro) => {
                 log(&format!("não deu para listar os processos: {erro}"));
-                esperar(cfg.modo_jogo.intervalo_segundos, parar);
+                espera.esperar(cfg.modo_jogo.intervalo_segundos, parar, false);
                 continue;
             }
         };
@@ -103,7 +242,30 @@ pub fn rodar(caminho_config: &Path, parar: &AtomicBool, log: &mut dyn FnMut(&str
                 }
             }
         }
-        esperar(cfg.modo_jogo.intervalo_segundos, parar);
+
+        let novo = StatusVigia {
+            ativo: cfg.modo_jogo.ativo,
+            modo: cfg.modo_jogo.modo,
+            intervalo_segundos: cfg.modo_jogo.intervalo_segundos,
+            jogo: partida.as_ref().map(|p| p.jogo.nome.clone()),
+            jogo_desde_unix: match (&partida, &atual.jogo) {
+                (Some(_), Some(_)) => atual.jogo_desde_unix,
+                (Some(_), None) => Some(chrono::Utc::now().timestamp()),
+                (None, _) => None,
+            },
+            ..atual.clone()
+        };
+        if novo != atual {
+            atual = novo;
+            publicar(&pasta_dados, &atual, status);
+        }
+
+        let intervalo = cfg.modo_jogo.intervalo_segundos;
+        let atento = ultimo_processo_aberto.is_some_and(|t| t.elapsed() < ATENCAO_DEPOIS_DE_ABRIR);
+        let segundos = if partida.is_none() && eventos_do_windows && !atento { ESPERA_COM_EVENTOS } else { intervalo };
+        if espera.esperar(segundos, parar, partida.is_some()) {
+            ultimo_processo_aberto = Some(Instant::now());
+        }
     }
 
     if let Some(p) = partida.take() {
@@ -111,7 +273,16 @@ pub fn rodar(caminho_config: &Path, parar: &AtomicBool, log: &mut dyn FnMut(&str
         let processos = fonte.processos().unwrap_or_default();
         terminar(p, &cfg, &processos, &pasta_dados, log);
     }
+    let _ = std::fs::remove_file(arquivo_de_status(&pasta_dados));
     log("vigia encerrado");
+}
+
+fn publicar(pasta_dados: &Path, atual: &StatusVigia, status: &mut dyn FnMut(&StatusVigia)) {
+    if let Ok(json) = serde_json::to_vec_pretty(atual) {
+        let _ = std::fs::create_dir_all(pasta_dados);
+        let _ = std::fs::write(arquivo_de_status(pasta_dados), json);
+    }
+    status(atual);
 }
 
 fn comecar(jogo: Jogo, cfg: &Config, processos: &[Processo], estado: &Path, log: &mut dyn FnMut(&str)) -> Partida {
@@ -262,14 +433,6 @@ fn carregar(caminho: &Path, log: &mut dyn FnMut(&str)) -> (Config, Option<System
 
 fn data_do_arquivo(caminho: &Path) -> Option<SystemTime> {
     std::fs::metadata(caminho).and_then(|m| m.modified()).ok()
-}
-
-/// Dorme em pedaços de 100 ms para responder rápido ao Ctrl+C.
-fn esperar(segundos: u64, parar: &AtomicBool) {
-    let fim = Instant::now() + Duration::from_secs(segundos.max(1));
-    while Instant::now() < fim && !parar.load(Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 fn nome_do_modo(modo: Modo) -> &'static str {

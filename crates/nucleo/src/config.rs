@@ -133,10 +133,30 @@ impl Default for ConfigRam {
     }
 }
 
+impl Modo {
+    pub fn texto(self) -> &'static str {
+        match self {
+            Self::Observar => "observar",
+            Self::Otimizar => "otimizar",
+        }
+    }
+}
+
+impl Prioridade {
+    pub fn texto(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::AcimaDoNormal => "acima_do_normal",
+            Self::Alta => "alta",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ErroConfig {
     Ler { caminho: PathBuf, erro: io::Error },
-    Formato { caminho: PathBuf, erro: Box<toml::de::Error> },
+    Formato { caminho: PathBuf, mensagem: String },
+    Gravar { caminho: PathBuf, erro: io::Error },
 }
 
 impl fmt::Display for ErroConfig {
@@ -145,8 +165,11 @@ impl fmt::Display for ErroConfig {
             Self::Ler { caminho, erro } => {
                 write!(f, "não deu para ler {}: {erro}", caminho.display())
             }
-            Self::Formato { caminho, erro } => {
-                write!(f, "config inválido em {}:\n{erro}", caminho.display())
+            Self::Formato { caminho, mensagem } => {
+                write!(f, "config inválido em {}:\n{mensagem}", caminho.display())
+            }
+            Self::Gravar { caminho, erro } => {
+                write!(f, "não deu para gravar {}: {erro}", caminho.display())
             }
         }
     }
@@ -183,8 +206,84 @@ pub fn carregar(caminho: &Path) -> Result<Config, ErroConfig> {
     };
     toml::from_str(&texto).map_err(|erro| ErroConfig::Formato {
         caminho: caminho.to_owned(),
-        erro: Box::new(erro),
+        mensagem: erro.to_string(),
     })
+}
+
+/// Muda uma seção do arquivo sem perder os comentários nem a ordem do
+/// resto. Se o arquivo não existir, parte do modelo comentado. Só grava
+/// se o resultado continuar válido, e devolve o config novo.
+pub fn alterar_secao(
+    caminho: &Path,
+    secao: &str,
+    mudar: impl FnOnce(&mut toml_edit::Table),
+) -> Result<Config, ErroConfig> {
+    let formato = |mensagem: String| ErroConfig::Formato { caminho: caminho.to_owned(), mensagem };
+    let texto = match std::fs::read_to_string(caminho) {
+        Ok(texto) => texto,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => MODELO.to_owned(),
+        Err(erro) => return Err(ErroConfig::Ler { caminho: caminho.to_owned(), erro }),
+    };
+    let mut doc: toml_edit::DocumentMut = texto.parse().map_err(|e: toml_edit::TomlError| formato(e.to_string()))?;
+    let tabela = doc
+        .entry(secao)
+        .or_insert_with(toml_edit::table)
+        .as_table_mut()
+        .ok_or_else(|| formato(format!("[{secao}] precisa ser uma seção")))?;
+    mudar(tabela);
+    let novo = doc.to_string();
+    let config: Config = toml::from_str(&novo).map_err(|e| formato(e.to_string()))?;
+    let gravar = |erro| ErroConfig::Gravar { caminho: caminho.to_owned(), erro };
+    if let Some(pasta) = caminho.parent() {
+        std::fs::create_dir_all(pasta).map_err(gravar)?;
+    }
+    std::fs::write(caminho, novo).map_err(gravar)?;
+    Ok(config)
+}
+
+/// Grava todas as opções do modo jogo (usado pelo painel).
+pub fn salvar_modo_jogo(caminho: &Path, m: &ConfigModoJogo) -> Result<Config, ErroConfig> {
+    use toml_edit::value;
+    alterar_secao(caminho, "modo_jogo", |t| {
+        t["ativo"] = value(m.ativo);
+        t["modo"] = value(m.modo.texto());
+        t["jogos"] = lista(&m.jogos);
+        t["detectar_pelas_pastas"] = value(m.detectar_pelas_pastas);
+        t["pastas_de_jogos"] = lista(&m.pastas_de_jogos);
+        t["ignorar"] = lista(&m.ignorar);
+        t["intervalo_segundos"] = value(m.intervalo_segundos as i64);
+        t["prioridade"] = value(m.prioridade.texto());
+        t["plano_alto_desempenho"] = value(m.plano_alto_desempenho);
+        t["plano_somente_na_tomada"] = value(m.plano_somente_na_tomada);
+        t["pausar"] = lista(&m.pausar);
+        t["fechar"] = lista(&m.fechar);
+    })
+}
+
+/// Liga ou desliga o modo jogo (usado pelo menu do ícone).
+pub fn definir_ativo(caminho: &Path, ativo: bool) -> Result<Config, ErroConfig> {
+    alterar_secao(caminho, "modo_jogo", |t| t["ativo"] = toml_edit::value(ativo))
+}
+
+/// Troca entre observar e otimizar (usado pelo menu do ícone).
+pub fn definir_modo(caminho: &Path, modo: Modo) -> Result<Config, ErroConfig> {
+    alterar_secao(caminho, "modo_jogo", |t| t["modo"] = toml_edit::value(modo.texto()))
+}
+
+/// Lista TOML; com mais de 3 itens, um por linha.
+fn lista(itens: &[String]) -> toml_edit::Item {
+    let mut array = toml_edit::Array::new();
+    for item in itens {
+        array.push(item.as_str());
+    }
+    if itens.len() > 3 {
+        for valor in array.iter_mut() {
+            valor.decor_mut().set_prefix("\n    ");
+        }
+        array.set_trailing("\n");
+        array.set_trailing_comma(true);
+    }
+    toml_edit::value(array)
 }
 
 /// Grava o modelo comentado se o arquivo ainda não existir.
@@ -214,6 +313,35 @@ mod testes {
     fn arquivo_vazio_usa_padroes() {
         let lido: Config = toml::from_str("").unwrap();
         assert_eq!(lido, Config::default());
+    }
+
+    #[test]
+    fn alterar_mantem_comentarios_e_valida() {
+        let pasta = crate::disco::testes::PastaTeste::nova("config");
+        let caminho = pasta.0.join("config.toml");
+
+        // Sem arquivo: parte do modelo comentado.
+        let cfg = definir_modo(&caminho, Modo::Otimizar).unwrap();
+        assert_eq!(cfg.modo_jogo.modo, Modo::Otimizar);
+        let texto = std::fs::read_to_string(&caminho).unwrap();
+        assert!(texto.contains("# Configuração do Makeway."));
+        assert!(texto.contains("# Comece observando umas 3 partidas"));
+        assert!(texto.contains("modo = \"otimizar\""));
+
+        let mut m = cfg.modo_jogo.clone();
+        m.jogos = vec!["VALORANT-Win64-Shipping.exe".into()];
+        m.pausar = ["a.exe", "b.exe", "c.exe", "d.exe"].map(String::from).to_vec();
+        m.prioridade = Prioridade::AcimaDoNormal;
+        let cfg = salvar_modo_jogo(&caminho, &m).unwrap();
+        assert_eq!(cfg.modo_jogo, m);
+        assert_eq!(carregar(&caminho).unwrap().modo_jogo, m);
+        let texto = std::fs::read_to_string(&caminho).unwrap();
+        assert!(texto.contains("# Um app pausado não faz nada"));
+        assert!(texto.contains("pausar = [\n    \"a.exe\""));
+        // Caminhos com barra invertida continuam legíveis.
+        assert!(texto.contains(r"'\steamapps\common\'"), "{texto}");
+
+        assert!(!definir_ativo(&caminho, false).unwrap().modo_jogo.ativo);
     }
 
     #[test]

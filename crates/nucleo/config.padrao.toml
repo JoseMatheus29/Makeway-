@@ -55,6 +55,10 @@ prioridade = "alta"
 plano_alto_desempenho = true
 # ...mas não quando o notebook está na bateria.
 plano_somente_na_tomada = true
+# Os apps que continuam abertos (navegador, Discord, launchers) ficam com
+# prioridade de memória baixa durante o jogo: quando a RAM aperta, o
+# Windows tira deles primeiro e não do jogo. Eles continuam funcionando.
+memoria_baixa_nos_apps = true
 # Apps pausados enquanto o jogo roda e retomados quando ele fecha. A RAM
 # deles volta para o sistema. Exemplo: ["OneDrive.exe", "Docker Desktop.exe"]
 # Um app pausado não faz nada: nem a voz do Discord nem um download.

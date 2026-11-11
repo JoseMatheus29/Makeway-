@@ -4,6 +4,7 @@
 use eframe::egui::{self, Align, Color32, Frame, Layout, Margin, Rect, Shape, Stroke, Ui, Vec2, pos2, vec2};
 use nucleo::config::Modo;
 use nucleo::formato::duracao;
+use nucleo::paginacao::{Paginacao, perto_do_limite};
 
 use super::{Nivel, maior_app_pausavel, partida_boa, quando, rival_da_partida, tamanho_curto, veredito_da_memoria};
 use crate::app::{Contexto, Tela};
@@ -23,6 +24,8 @@ enum Acao {
     Limpar,
     Ir(Tela),
     ComWindows,
+    /// Abre as Opções de desempenho do Windows (memória virtual).
+    Desempenho,
 }
 
 struct Boost {
@@ -296,6 +299,33 @@ fn montar_boosts(c: &Contexto) -> Vec<Boost> {
             acao: Acao::ComWindows,
         });
     }
+
+    // Arquivo de paginação que não cresce: sempre que desligado; com
+    // tamanho fixo, só se a memória já chegou perto do limite.
+    let perto_agora = c.dados.ram.as_ref().is_some_and(|r| perto_do_limite(r.memoria.confirmada, r.memoria.limite_confirmada));
+    let perto_na_partida = ultima.is_some_and(|r| perto_do_limite(r.confirmada_max, r.limite_confirmada));
+    match c.dados.paginacao {
+        Some(Paginacao::Desligada) => lista.push(Boost {
+            icone: Icone::Alerta,
+            titulo: "Ligar o arquivo de paginação".into(),
+            texto: "Sem ele, quando a memória acaba o jogo fecha sozinho. Deixe o Windows gerenciar o tamanho em Avançado > Memória virtual.".into(),
+            ganho: "Sem fechar sozinho".into(),
+            botao: "Abrir",
+            acao: Acao::Desempenho,
+        }),
+        Some(Paginacao::Fixa { maximo }) if perto_agora || perto_na_partida => lista.push(Boost {
+            icone: Icone::Alerta,
+            titulo: "Deixar o arquivo de paginação crescer".into(),
+            texto: format!(
+                "A memória chegou perto do limite e o arquivo tem tamanho fixo (até {}). Marque \"Gerenciar automaticamente\" em Avançado > Memória virtual.",
+                tamanho_curto(maximo)
+            ),
+            ganho: "Sem fechar sozinho".into(),
+            botao: "Abrir",
+            acao: Acao::Desempenho,
+        }),
+        _ => {}
+    }
     lista
 }
 
@@ -354,6 +384,7 @@ fn boosts(ui: &mut Ui, c: &mut Contexto) {
             Acao::Limpar => c.confirmar_limpeza = true,
             Acao::Ir(tela) => c.ir_para = Some(*tela),
             Acao::ComWindows => c.mudar_com_windows(&ctx, true),
+            Acao::Desempenho => nucleo::plataforma::abrir_opcoes_de_desempenho(),
         }
     }
 }

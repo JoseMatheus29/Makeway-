@@ -142,6 +142,14 @@ impl TelaModoJogo {
                 &mut m.plano_alto_desempenho,
             );
             separador(ui);
+            linha_com_chave(
+                ui,
+                Icone::Chip,
+                "Memória primeiro para o jogo",
+                "Os apps que continuam abertos ficam em segundo plano na memória: quando ela aperta, o Windows tira deles e não do jogo. Eles continuam funcionando.",
+                &mut m.memoria_baixa_nos_apps,
+            );
+            separador(ui);
             ui.add_space(16.0);
             let p = paleta(ui);
             ui.horizontal_top(|ui| {

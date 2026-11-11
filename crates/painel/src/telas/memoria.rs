@@ -10,9 +10,10 @@ use eframe::egui::{
 };
 use nucleo::formato::{decimal, mb};
 use nucleo::modo_jogo::protecao::Protecao;
+use nucleo::paginacao::{Paginacao, perto_do_limite};
 use nucleo::ram::RelatorioRam;
 
-use super::{Nivel, tamanho_curto, veredito_da_memoria};
+use super::{Nivel, aviso_de_limite, nome_da_paginacao, tamanho_curto, veredito_da_memoria};
 use crate::app::Contexto;
 use crate::componentes::{
     CORTE, CORTE_P, apoio, botao_secundario, brilho, cartao, cartao_com, chip, cortar, forma_cortada, forte, link,
@@ -51,12 +52,22 @@ impl TelaMemoria {
         };
         titulo_da_pagina(ui, &chamada, "Memória", &subtitulo);
         agora(ui, &r);
+        // Perto do limite agora ou, se não, na última partida.
+        let ultima = c.dados.partidas.first().map(|(_, s)| s);
+        if perto_do_limite(m.confirmada, m.limite_confirmada) {
+            ui.add_space(16.0);
+            aviso_de_limite(ui, "Perto do limite de memória", m.confirmada, m.limite_confirmada, c.dados.paginacao);
+        } else if let Some(s) = ultima.filter(|s| perto_do_limite(s.confirmada_max, s.limite_confirmada)) {
+            ui.add_space(16.0);
+            let titulo = format!("Na última partida de {}, a memória chegou perto do limite", s.jogo.trim_end_matches(".exe"));
+            aviso_de_limite(ui, &titulo, s.confirmada_max, s.limite_confirmada, c.dados.paginacao);
+        }
         ui.add_space(22.0);
         self.quem_usa(ui, c, &r);
         ui.add_space(22.0);
         abrem_com_o_windows(ui, c);
         ui.add_space(22.0);
-        self.detalhes_tecnicos(ui, &r);
+        self.detalhes_tecnicos(ui, &r, c.dados.paginacao);
     }
 
     fn quem_usa(&mut self, ui: &mut Ui, c: &mut Contexto, r: &RelatorioRam) {
@@ -145,7 +156,7 @@ impl TelaMemoria {
         }
     }
 
-    fn detalhes_tecnicos(&mut self, ui: &mut Ui, r: &RelatorioRam) {
+    fn detalhes_tecnicos(&mut self, ui: &mut Ui, r: &RelatorioRam, paginacao: Option<Paginacao>) {
         let p = paleta(ui);
         let m = &r.memoria;
         cartao_com(ui, Margin::symmetric(28, 4), |ui| {
@@ -184,6 +195,9 @@ impl TelaMemoria {
                 itens.push(("Modificada / livre", format!("{} / {}", tamanho_curto(l.modificada), tamanho_curto(l.livre))));
             }
             itens.push(("Pools (pag. / não pag.)", format!("{} / {}", mb(m.pool_paginado), mb(m.pool_nao_paginado))));
+            if let Some(paginacao) = paginacao {
+                itens.push(("Arquivo de paginação", nome_da_paginacao(paginacao)));
+            }
             itens.push(("Processos abertos", decimal(r.processos.len() as f64, 0)));
             for linha in itens.chunks(4) {
                 ui.columns(4, |colunas| {

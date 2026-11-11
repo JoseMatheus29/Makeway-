@@ -28,3 +28,11 @@ pub use crate::sistema::{espaco_no_disco, primeiro_nome};
 pub fn abrir_configuracoes(pagina: &str) {
     let _ = std::process::Command::new("explorer.exe").arg(pagina).spawn();
 }
+
+/// Abre as Opções de desempenho do Windows (Avançado > Memória virtual).
+/// Passa pelo Explorer para o Windows pedir permissão se precisar.
+pub fn abrir_opcoes_de_desempenho() {
+    let pasta = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let exe = std::path::Path::new(&pasta).join("System32").join("SystemPropertiesPerformance.exe");
+    let _ = std::process::Command::new("explorer.exe").arg(exe).spawn();
+}

@@ -48,11 +48,11 @@ use windows::Win32::System::SystemInformation::{
     GetPhysicallyInstalledSystemMemory, GlobalMemoryStatusEx, MEMORYSTATUSEX,
 };
 use windows::Win32::System::Threading::{
-    CreateMutexW, GetCurrentProcess, GetPriorityClass, OpenMutexW, OpenProcess, OpenProcessToken,
-    PROCESS_ACCESS_RIGHTS, PROCESS_CREATION_FLAGS, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA,
-    PROCESS_SUSPEND_RESUME, QueryFullProcessImageNameW, SYNCHRONIZATION_SYNCHRONIZE,
-    SetPriorityClass,
+    CreateMutexW, GetCurrentProcess, GetPriorityClass, GetProcessInformation, MEMORY_PRIORITY,
+    MEMORY_PRIORITY_INFORMATION, OpenMutexW, OpenProcess, OpenProcessToken, PROCESS_ACCESS_RIGHTS,
+    PROCESS_CREATION_FLAGS, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION,
+    PROCESS_SET_QUOTA, PROCESS_SUSPEND_RESUME, ProcessMemoryPriority, QueryFullProcessImageNameW,
+    SYNCHRONIZATION_SYNCHRONIZE, SetPriorityClass, SetProcessInformation,
 };
 use windows::Win32::Foundation::LRESULT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -221,6 +221,40 @@ pub fn definir_prioridade(pid: u32, classe: u32) -> io::Result<()> {
     let h = abrir_processo(pid, PROCESS_SET_INFORMATION)?;
     // SAFETY: handle válido com o acesso pedido.
     unsafe { SetPriorityClass(h.0, PROCESS_CREATION_FLAGS(classe)) }.map_err(io::Error::from)
+}
+
+/// Prioridade de memória: 5 é a normal, 2 é baixa, 1 é muito baixa.
+/// Quando falta RAM, o Windows tira primeiro as páginas de quem tem a
+/// prioridade mais baixa, e elas também saem antes da lista de espera.
+pub fn prioridade_de_memoria(pid: u32) -> io::Result<u32> {
+    let h = abrir_processo(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let mut info = MEMORY_PRIORITY_INFORMATION::default();
+    // SAFETY: handle válido; a estrutura tem o tamanho que essa classe pede.
+    unsafe {
+        GetProcessInformation(
+            h.0,
+            ProcessMemoryPriority,
+            &mut info as *mut MEMORY_PRIORITY_INFORMATION as *mut core::ffi::c_void,
+            size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
+        )
+    }
+    .map_err(io::Error::from)?;
+    Ok(info.MemoryPriority.0)
+}
+
+pub fn definir_prioridade_de_memoria(pid: u32, nivel: u32) -> io::Result<()> {
+    let h = abrir_processo(pid, PROCESS_SET_INFORMATION)?;
+    let info = MEMORY_PRIORITY_INFORMATION { MemoryPriority: MEMORY_PRIORITY(nivel) };
+    // SAFETY: handle válido; a estrutura tem o tamanho que essa classe pede.
+    unsafe {
+        SetProcessInformation(
+            h.0,
+            ProcessMemoryPriority,
+            &info as *const MEMORY_PRIORITY_INFORMATION as *const core::ffi::c_void,
+            size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
+        )
+    }
+    .map_err(io::Error::from)
 }
 
 /// Caminho completo do .exe.
@@ -743,6 +777,17 @@ mod testes {
         assert!(memoria.total > 0);
         assert!(memoria.disponivel <= memoria.total);
         assert!(memoria.limite_confirmada >= memoria.confirmada);
+    }
+
+    #[test]
+    fn muda_e_devolve_a_prioridade_de_memoria_deste_processo() {
+        let eu = std::process::id();
+        let original = prioridade_de_memoria(eu).unwrap();
+        assert!((1..=5).contains(&original), "{original}");
+        definir_prioridade_de_memoria(eu, 2).unwrap();
+        assert_eq!(prioridade_de_memoria(eu).unwrap(), 2);
+        definir_prioridade_de_memoria(eu, original).unwrap();
+        assert_eq!(prioridade_de_memoria(eu).unwrap(), original);
     }
 
     #[test]

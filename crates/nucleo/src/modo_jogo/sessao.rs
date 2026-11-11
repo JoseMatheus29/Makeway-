@@ -38,7 +38,24 @@ pub enum Alteracao {
     Pausa { pid: u32, criado_em: i64, nome: String },
     /// Não se desfaz: fica anotado para o relatório.
     Fechamento { pid: u32, nome: String },
+    /// Prioridade de memória baixada em vários apps de uma vez: uma
+    /// anotação só, para não regravar o arquivo centenas de vezes.
+    MemoriaBaixa { processos: Vec<MemoriaOriginal> },
 }
+
+/// Um processo com a prioridade de memória baixada e a que ele tinha.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoriaOriginal {
+    pub pid: u32,
+    pub criado_em: i64,
+    pub nome: String,
+    pub original: u32,
+}
+
+/// Prioridade de memória usada nos apps de fundo durante o jogo
+/// (`MEMORY_PRIORITY_LOW`). A "muito baixa" faria o Windows tirar memória
+/// deles cedo demais, até do Discord no meio de uma chamada.
+pub const MEMORIA_BAIXA: u32 = 2;
 
 impl Alteracao {
     pub fn descricao(&self) -> String {
@@ -51,6 +68,9 @@ impl Alteracao {
             Self::Prioridade { nome, .. } => format!("prioridade alta para {nome}"),
             Self::Pausa { nome, pid, .. } => format!("pausou {nome} (PID {pid})"),
             Self::Fechamento { nome, pid } => format!("pediu para fechar {nome} (PID {pid})"),
+            Self::MemoriaBaixa { processos } => {
+                format!("prioridade de memória baixa para {} processos", processos.len())
+            }
         }
     }
 }
@@ -63,6 +83,12 @@ fn hex(texto: &str) -> u128 {
 pub trait Acoes {
     /// O processo com este PID e esta hora de criação ainda existe.
     fn vivo(&mut self, pid: u32, criado_em: i64) -> bool;
+    /// O mesmo para vários de uma vez (no Windows, uma foto só dos processos).
+    fn vivos(&mut self, lista: &[(u32, i64)]) -> Vec<bool> {
+        lista.iter().map(|&(pid, criado_em)| self.vivo(pid, criado_em)).collect()
+    }
+    fn prioridade_de_memoria(&mut self, pid: u32) -> io::Result<u32>;
+    fn definir_prioridade_de_memoria(&mut self, pid: u32, nivel: u32) -> io::Result<()>;
     fn pausar(&mut self, pid: u32) -> io::Result<()>;
     fn retomar(&mut self, pid: u32) -> io::Result<()>;
     fn esvaziar_memoria(&mut self, pid: u32) -> io::Result<()>;
@@ -81,6 +107,18 @@ impl Acoes for AcoesWindows {
         sistema::listar_processos()
             .map(|lista| lista.iter().any(|p| p.pid == pid && p.criado_em == criado_em))
             .unwrap_or(false)
+    }
+    fn vivos(&mut self, lista: &[(u32, i64)]) -> Vec<bool> {
+        let agora: std::collections::HashSet<(u32, i64)> = sistema::listar_processos()
+            .map(|processos| processos.iter().map(|p| (p.pid, p.criado_em)).collect())
+            .unwrap_or_default();
+        lista.iter().map(|chave| agora.contains(chave)).collect()
+    }
+    fn prioridade_de_memoria(&mut self, pid: u32) -> io::Result<u32> {
+        sistema::prioridade_de_memoria(pid)
+    }
+    fn definir_prioridade_de_memoria(&mut self, pid: u32, nivel: u32) -> io::Result<()> {
+        sistema::definir_prioridade_de_memoria(pid, nivel)
     }
     fn pausar(&mut self, pid: u32) -> io::Result<()> {
         sistema::pausar_processo(pid)
@@ -185,6 +223,43 @@ impl<A: Acoes> Sessao<A> {
         Ok(self.acoes.esvaziar_memoria(p.pid).err())
     }
 
+    /// Baixa a prioridade de memória dos processos para `nivel`. Anota todos
+    /// de uma vez, antes de mexer; os que o Windows não deixar mudar saem da
+    /// anotação. Quem já tinha a prioridade igual ou menor fica de fora.
+    /// Devolve quantos mudaram.
+    pub fn baixar_memoria(&mut self, processos: &[&Processo], nivel: u32) -> io::Result<usize> {
+        let mut lista: Vec<MemoriaOriginal> = processos
+            .iter()
+            .filter_map(|p| {
+                let original = self.acoes.prioridade_de_memoria(p.pid).ok()?;
+                (original > nivel).then(|| MemoriaOriginal {
+                    pid: p.pid,
+                    criado_em: p.criado_em,
+                    nome: p.nome.clone(),
+                    original,
+                })
+            })
+            .collect();
+        if lista.is_empty() {
+            return Ok(0);
+        }
+        self.estado.alteracoes.push(Alteracao::MemoriaBaixa { processos: lista.clone() });
+        if let Err(erro) = gravar(&self.arquivo, &self.estado) {
+            self.estado.alteracoes.pop();
+            return Err(erro);
+        }
+        lista.retain(|m| self.acoes.definir_prioridade_de_memoria(m.pid, nivel).is_ok());
+        self.estado.alteracoes.pop();
+        let mudaram = lista.len();
+        if mudaram > 0 {
+            self.estado.alteracoes.push(Alteracao::MemoriaBaixa { processos: lista });
+        }
+        // Se esta gravação falhar, fica no disco a lista maior: devolver a
+        // prioridade original a quem não mudou não faz mal nenhum.
+        let _ = gravar(&self.arquivo, &self.estado);
+        Ok(mudaram)
+    }
+
     /// Pede para as janelas fecharem. Devolve quantas janelas receberam o pedido.
     pub fn fechar(&mut self, p: &Processo) -> io::Result<usize> {
         let mut janelas = 0;
@@ -223,6 +298,16 @@ fn desfazer_lista<A: Acoes>(acoes: &mut A, alteracoes: &mut Vec<Alteracao>) -> V
     let mut problemas = Vec::new();
     let mut restantes = Vec::new();
     while let Some(alteracao) = alteracoes.pop() {
+        if let Alteracao::MemoriaBaixa { processos } = alteracao {
+            // Um por um: só os que falharem continuam anotados.
+            let (sobra, erro) = devolver_memoria(acoes, processos);
+            if let Some(erro) = erro {
+                let alteracao = Alteracao::MemoriaBaixa { processos: sobra };
+                problemas.push(format!("não deu para desfazer \"{}\": {erro}", alteracao.descricao()));
+                restantes.push(alteracao);
+            }
+            continue;
+        }
         if let Err(erro) = desfazer(acoes, &alteracao) {
             problemas.push(format!("não deu para desfazer \"{}\": {erro}", alteracao.descricao()));
             restantes.push(alteracao);
@@ -233,8 +318,31 @@ fn desfazer_lista<A: Acoes>(acoes: &mut A, alteracoes: &mut Vec<Alteracao>) -> V
     problemas
 }
 
+/// Devolve a prioridade de memória original aos que ainda estão abertos.
+/// Devolve os que falharam e o último erro.
+fn devolver_memoria<A: Acoes>(acoes: &mut A, processos: Vec<MemoriaOriginal>) -> (Vec<MemoriaOriginal>, Option<io::Error>) {
+    let chaves: Vec<(u32, i64)> = processos.iter().map(|m| (m.pid, m.criado_em)).collect();
+    let vivos = acoes.vivos(&chaves);
+    let mut sobra = Vec::new();
+    let mut ultimo_erro = None;
+    for (m, vivo) in processos.into_iter().zip(vivos) {
+        if !vivo {
+            continue; // fechou: não há o que desfazer
+        }
+        if let Err(erro) = acoes.definir_prioridade_de_memoria(m.pid, m.original) {
+            ultimo_erro = Some(erro);
+            sobra.push(m);
+        }
+    }
+    (sobra, ultimo_erro)
+}
+
 fn desfazer<A: Acoes>(acoes: &mut A, alteracao: &Alteracao) -> io::Result<()> {
     match alteracao {
+        Alteracao::MemoriaBaixa { processos } => match devolver_memoria(acoes, processos.clone()).1 {
+            Some(erro) => Err(erro),
+            None => Ok(()),
+        },
         Alteracao::PlanoEnergia { original, .. } => acoes.definir_plano_energia(hex(original)),
         // Se o processo fechou, não há o que desfazer.
         Alteracao::Prioridade { pid, criado_em, original, .. } => {
@@ -294,6 +402,15 @@ impl<A: Acoes> Acoes for &mut A {
     fn vivo(&mut self, pid: u32, criado_em: i64) -> bool {
         (**self).vivo(pid, criado_em)
     }
+    fn vivos(&mut self, lista: &[(u32, i64)]) -> Vec<bool> {
+        (**self).vivos(lista)
+    }
+    fn prioridade_de_memoria(&mut self, pid: u32) -> io::Result<u32> {
+        (**self).prioridade_de_memoria(pid)
+    }
+    fn definir_prioridade_de_memoria(&mut self, pid: u32, nivel: u32) -> io::Result<()> {
+        (**self).definir_prioridade_de_memoria(pid, nivel)
+    }
     fn pausar(&mut self, pid: u32) -> io::Result<()> {
         (**self).pausar(pid)
     }
@@ -334,12 +451,27 @@ pub(crate) mod testes {
         pub prioridades: std::collections::HashMap<u32, u32>,
         pub plano: u128,
         pub falhar_pausa: bool,
+        /// Prioridade de memória de cada PID (5 = normal se não estiver aqui).
+        pub memoria: std::collections::HashMap<u32, u32>,
+        /// PIDs em que o Windows "não deixa" mexer na memória.
+        pub memoria_negada: Vec<u32>,
         pub historico: Vec<String>,
     }
 
     impl Acoes for AcoesFalsas {
         fn vivo(&mut self, pid: u32, criado_em: i64) -> bool {
             self.vivos.contains(&(pid, criado_em))
+        }
+        fn prioridade_de_memoria(&mut self, pid: u32) -> io::Result<u32> {
+            Ok(*self.memoria.get(&pid).unwrap_or(&5))
+        }
+        fn definir_prioridade_de_memoria(&mut self, pid: u32, nivel: u32) -> io::Result<()> {
+            if self.memoria_negada.contains(&pid) {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            self.memoria.insert(pid, nivel);
+            self.historico.push(format!("memoria {pid} {nivel}"));
+            Ok(())
         }
         fn pausar(&mut self, pid: u32) -> io::Result<()> {
             if self.falhar_pausa {
@@ -465,6 +597,90 @@ pub(crate) mod testes {
         let mut depois = AcoesFalsas { vivos: vec![(20, 99)], ..Default::default() };
         restaurar_pendente(&arquivo, &mut depois).unwrap();
         assert!(depois.historico.is_empty());
+    }
+
+    #[test]
+    fn memoria_baixa_anota_so_quem_mudou_e_volta_ao_original() {
+        let pasta = PastaTeste::nova("memoria");
+        let arquivo = pasta.0.join("estado.json");
+        let (a, b, c) = (proc(20, 1, "a.exe", 20), proc(30, 1, "b.exe", 30), proc(40, 1, "c.exe", 40));
+        let mut acoes = AcoesFalsas {
+            vivos: vec![(20, 20), (30, 30), (40, 40)],
+            memoria: [(40, 1)].into(), // já estava "muito baixa": fica de fora
+            memoria_negada: vec![30],  // o Windows não deixa
+            ..Default::default()
+        };
+        {
+            let mut sessao = Sessao::nova(arquivo.clone(), "jogo.exe", &mut acoes);
+            assert_eq!(sessao.baixar_memoria(&[&a, &b, &c], MEMORIA_BAIXA).unwrap(), 1);
+            let gravado: Estado = serde_json::from_slice(&fs::read(&arquivo).unwrap()).unwrap();
+            let [Alteracao::MemoriaBaixa { processos }] = gravado.alteracoes.as_slice() else { panic!("{gravado:?}") };
+            assert_eq!(processos.iter().map(|m| m.pid).collect::<Vec<_>>(), [20]);
+            assert_eq!(processos[0].original, 5);
+        }
+        assert_eq!(acoes.historico, ["memoria 20 2", "memoria 20 5"]);
+        assert_eq!(acoes.memoria[&40], 1);
+        assert!(!arquivo.exists());
+    }
+
+    #[test]
+    fn memoria_baixa_e_devolvida_depois_de_morto_a_forca() {
+        let pasta = PastaTeste::nova("memoria-morto");
+        let arquivo = pasta.0.join("estado.json");
+        let mut acoes = acoes();
+        let mut sessao = Sessao::nova(arquivo.clone(), "jogo.exe", &mut acoes);
+        let apps = [proc(10, 1, "a.exe", 10), proc(20, 1, "b.exe", 20)];
+        assert_eq!(sessao.baixar_memoria(&[&apps[0], &apps[1]], MEMORIA_BAIXA).unwrap(), 2);
+        std::mem::forget(sessao);
+
+        // Na próxima execução, o PID 10 já fechou; o 20 continua aberto.
+        let mut depois = AcoesFalsas { vivos: vec![(20, 20)], memoria: [(20, 2)].into(), ..Default::default() };
+        let r = restaurar_pendente(&arquivo, &mut depois).unwrap().unwrap();
+        assert!(r.problemas.is_empty());
+        assert_eq!(depois.historico, ["memoria 20 5"]);
+        assert!(!arquivo.exists());
+    }
+
+    #[test]
+    fn memoria_que_nao_volta_continua_anotada() {
+        let pasta = PastaTeste::nova("memoria-falha");
+        let arquivo = pasta.0.join("estado.json");
+        let mut acoes = acoes();
+        let mut sessao = Sessao::nova(arquivo.clone(), "jogo.exe", &mut acoes);
+        sessao.baixar_memoria(&[&proc(10, 1, "a.exe", 10), &proc(20, 1, "b.exe", 20)], MEMORIA_BAIXA).unwrap();
+        std::mem::forget(sessao);
+
+        let mut depois = AcoesFalsas { vivos: vec![(10, 10), (20, 20)], memoria_negada: vec![20], ..Default::default() };
+        let r = restaurar_pendente(&arquivo, &mut depois).unwrap().unwrap();
+        assert_eq!(r.problemas.len(), 1);
+        let gravado: Estado = serde_json::from_slice(&fs::read(&arquivo).unwrap()).unwrap();
+        let [Alteracao::MemoriaBaixa { processos }] = gravado.alteracoes.as_slice() else { panic!("{gravado:?}") };
+        assert_eq!(processos.iter().map(|m| m.pid).collect::<Vec<_>>(), [20]);
+    }
+
+    /// Com o Windows de verdade: baixa a memória de um processo filho
+    /// descartável e confere que ela volta ao fim da sessão.
+    #[test]
+    fn memoria_baixa_de_verdade_num_processo_filho() {
+        let pasta = PastaTeste::nova("memoria-real");
+        let arquivo = pasta.0.join("estado.json");
+        let mut filho = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = filho.id();
+        let processo = sistema::listar_processos().unwrap().into_iter().find(|p| p.pid == pid).unwrap();
+        let original = sistema::prioridade_de_memoria(pid).unwrap();
+        {
+            let mut sessao = Sessao::nova(arquivo.clone(), "jogo.exe", AcoesWindows);
+            assert_eq!(sessao.baixar_memoria(&[&processo], MEMORIA_BAIXA).unwrap(), 1);
+            assert_eq!(sistema::prioridade_de_memoria(pid).unwrap(), MEMORIA_BAIXA);
+        }
+        assert_eq!(sistema::prioridade_de_memoria(pid).unwrap(), original);
+        assert!(!arquivo.exists());
+        let _ = filho.kill();
+        let _ = filho.wait();
     }
 
     #[test]

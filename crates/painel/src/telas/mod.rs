@@ -7,12 +7,18 @@ pub mod modo_jogo;
 pub mod partidas;
 
 use chrono::{Datelike, Local, TimeZone};
+use eframe::egui::{Align, Layout, RichText, Ui};
 use nucleo::formato::decimal;
 use nucleo::modo_jogo::protecao::Protecao;
 use nucleo::modo_jogo::relatorio::RelatorioSessao;
+use nucleo::paginacao::Paginacao;
+use nucleo::plataforma;
 use nucleo::ram::RelatorioRam;
 
 use crate::app::Contexto;
+use crate::componentes::{apoio, botao_secundario, faixa, paragrafo, rotulo};
+use crate::icones::{self, Icone};
+use crate::tema::{self, paleta};
 
 const GB: f64 = (1u64 << 30) as f64;
 
@@ -68,6 +74,71 @@ pub enum Nivel {
 pub fn partida_boa(r: &RelatorioSessao) -> bool {
     let cresceu = r.paginacao_max.saturating_sub(r.paginacao_inicio);
     r.ram_disponivel_min >= 1 << 30 && cresceu <= 256 << 20
+}
+
+/// Como o arquivo de paginação está, em poucas palavras.
+pub fn nome_da_paginacao(paginacao: Paginacao) -> String {
+    match paginacao {
+        Paginacao::Automatica => "Automático".into(),
+        Paginacao::GerenciadaPeloSistema => "Gerenciado pelo Windows".into(),
+        Paginacao::Fixa { maximo } => format!("Fixo, até {}", tamanho_curto(maximo)),
+        Paginacao::Desligada => "Desligado".into(),
+    }
+}
+
+/// O que fazer quando a memória chega perto do limite, conforme a paginação.
+pub fn conselho_do_limite(paginacao: Option<Paginacao>) -> String {
+    match paginacao {
+        Some(Paginacao::Desligada) => {
+            "O arquivo de paginação está desligado, então o limite é só a RAM. Ligue de novo em Avançado > Memória virtual, com \"Gerenciar automaticamente\" marcado.".into()
+        }
+        Some(Paginacao::Fixa { maximo }) => format!(
+            "O arquivo de paginação tem tamanho fixo (até {}) e não cresce. Em Avançado > Memória virtual, marque \"Gerenciar automaticamente\".",
+            tamanho_curto(maximo)
+        ),
+        _ => "O Windows aumenta o arquivo de paginação sozinho, mas isso pode dar uma travada. Pausar apps durante o jogo deixa mais folga.".into(),
+    }
+}
+
+/// O botão "Abrir no Windows" só ajuda quando dá para mudar algo lá.
+pub fn paginacao_para_mudar(paginacao: Option<Paginacao>) -> bool {
+    paginacao.is_some_and(|x| !x.cresce_sozinha())
+}
+
+/// Faixa vermelha: a memória chegou perto do limite (RAM + paginação),
+/// o que isso quer dizer e o que fazer.
+pub fn aviso_de_limite(ui: &mut Ui, titulo: &str, confirmada: u64, limite: u64, paginacao: Option<Paginacao>) {
+    let p = paleta(ui);
+    faixa(ui, p.perigo.gamma_multiply(0.12), |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 16.0;
+            icones::icone(ui, Icone::Alerta, 26.0, p.perigo);
+            let botao = paginacao_para_mudar(paginacao);
+            ui.vertical(|ui| {
+                ui.set_width((ui.available_width() - if botao { 200.0 } else { 0.0 }).max(220.0));
+                ui.spacing_mut().item_spacing.y = 3.0;
+                ui.label(rotulo(titulo, 14.0, p.perigo).family(tema::display()).extra_letter_spacing(2.2));
+                paragrafo(
+                    ui,
+                    RichText::new(format!(
+                        "{} de {} possíveis (RAM + arquivo de paginação). No limite, o jogo pode fechar sozinho por falta de memória.",
+                        tamanho_curto(confirmada),
+                        tamanho_curto(limite)
+                    ))
+                    .size(15.0)
+                    .color(p.txt),
+                );
+                paragrafo(ui, apoio(ui, conselho_do_limite(paginacao)).size(14.0));
+            });
+            if botao {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if botao_secundario(ui, "Abrir no Windows").on_hover_text("Abre as Opções de desempenho do Windows").clicked() {
+                        plataforma::abrir_opcoes_de_desempenho();
+                    }
+                });
+            }
+        });
+    });
 }
 
 /// App que vale sugerir pausar depois de uma partida: o que mais disputou

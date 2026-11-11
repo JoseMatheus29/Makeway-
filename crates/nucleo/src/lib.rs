@@ -13,6 +13,7 @@ pub mod inicio_automatico;
 pub mod jogos;
 pub mod modo_jogo;
 pub mod nomes;
+pub mod paginacao;
 pub mod ram;
 pub mod plataforma;
 mod sistema;

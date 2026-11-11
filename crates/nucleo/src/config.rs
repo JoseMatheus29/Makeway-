@@ -61,6 +61,7 @@ pub struct ConfigModoJogo {
     pub prioridade: Prioridade,
     pub plano_alto_desempenho: bool,
     pub plano_somente_na_tomada: bool,
+    pub memoria_baixa_nos_apps: bool,
     pub pausar: Vec<String>,
     pub fechar: Vec<String>,
 }
@@ -88,6 +89,7 @@ impl Default for ConfigModoJogo {
             prioridade: Prioridade::Alta,
             plano_alto_desempenho: true,
             plano_somente_na_tomada: true,
+            memoria_baixa_nos_apps: true,
             pausar: Vec::new(),
             fechar: Vec::new(),
         }
@@ -255,6 +257,7 @@ pub fn salvar_modo_jogo(caminho: &Path, m: &ConfigModoJogo) -> Result<Config, Er
         t["prioridade"] = value(m.prioridade.texto());
         t["plano_alto_desempenho"] = value(m.plano_alto_desempenho);
         t["plano_somente_na_tomada"] = value(m.plano_somente_na_tomada);
+        t["memoria_baixa_nos_apps"] = value(m.memoria_baixa_nos_apps);
         t["pausar"] = lista(&m.pausar);
         t["fechar"] = lista(&m.fechar);
     })

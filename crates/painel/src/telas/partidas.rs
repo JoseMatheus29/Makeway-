@@ -8,8 +8,9 @@ use eframe::egui::{self, Align, Align2, Color32, FontId, Layout, Margin, Pos2, R
 use egui_plot::{HLine, HoverPosition, Line, LineStyle, Plot, PlotPoint, PlotPoints, Polygon, Text};
 use nucleo::formato::{decimal, duracao};
 use nucleo::modo_jogo::relatorio::{self, Amostra, RelatorioSessao};
+use nucleo::paginacao::perto_do_limite;
 
-use super::{partida_boa, quando, rival_da_partida, tamanho_curto};
+use super::{aviso_de_limite, partida_boa, quando, rival_da_partida, tamanho_curto};
 use crate::app::Contexto;
 use crate::componentes::{
     CORTE_P, botao_primario, cartao, cartao_com, cortado, cortar, faixa, forma_cortada, forte, medidor_em,
@@ -221,6 +222,10 @@ fn detalhes(ui: &mut Ui, c: &mut Contexto, r: &RelatorioSessao, amostras: &[Amos
                     });
                 }
             });
+        }
+
+        if perto_do_limite(r.confirmada_max, r.limite_confirmada) {
+            aviso_de_limite(ui, "Chegou perto do limite de memória", r.confirmada_max, r.limite_confirmada, c.dados.paginacao);
         }
 
         faixa(ui, p.lime_dim, |ui| {

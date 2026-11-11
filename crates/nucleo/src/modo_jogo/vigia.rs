@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use super::deteccao::{self, FonteProcessos, Jogo, ProcessosDoWindows};
 use super::eventos;
-use super::protecao::Protecao;
+use super::protecao::{LAUNCHERS, Protecao};
 use super::relatorio::{self, Amostrador};
-use super::sessao::{ALTO_DESEMPENHO, AcoesWindows, Sessao, restaurar_pendente};
+use super::sessao::{ALTO_DESEMPENHO, AcoesWindows, MEMORIA_BAIXA, Sessao, restaurar_pendente};
 use crate::config::{self, Config, Modo, Prioridade};
 use crate::ram::{self, Processo};
 use crate::sistema;
@@ -345,6 +345,16 @@ fn aplicar(sessao: &mut Sessao<AcoesWindows>, jogo: &Jogo, cfg: &Config, process
     }
 
     let protecao = Protecao::nova(processos, Some(jogo.pid));
+    // Antes de pausar: assim a memória que os pausados devolvem também
+    // entra na lista de espera com prioridade baixa e sai antes da do jogo.
+    if m.memoria_baixa_nos_apps {
+        let alvos = apps_de_fundo(processos, &protecao, &jogo.nome, &m.fechar);
+        match sessao.baixar_memoria(&alvos, MEMORIA_BAIXA) {
+            Ok(0) => {}
+            Ok(n) => feitas.push(format!("prioridade de memória baixa para {n} processos em segundo plano")),
+            Err(erro) => avisos.push(format!("não deu para baixar a prioridade de memória dos apps: {erro}")),
+        }
+    }
     for (lista, fechar) in [(&m.fechar, true), (&m.pausar, false)] {
         let nomes: BTreeSet<String> = lista.iter().map(|n| n.to_lowercase()).collect();
         for nome in &nomes {
@@ -387,6 +397,23 @@ fn aplicar(sessao: &mut Sessao<AcoesWindows>, jogo: &Jogo, cfg: &Config, process
         }
     }
     (feitas, avisos)
+}
+
+/// Quem fica com a prioridade de memória baixa durante o jogo: tudo o que
+/// não é protegido (Windows, serviços, anti-cheat, o jogo e o que ele
+/// abriu), nem outro processo com o nome do jogo, nem launcher ou overlay
+/// (o overlay aparece em cima do jogo), nem o que vai ser fechado.
+fn apps_de_fundo<'a>(processos: &'a [Processo], protecao: &Protecao, jogo: &str, fechar: &[String]) -> Vec<&'a Processo> {
+    processos
+        .iter()
+        .filter(|p| protecao.motivo(p).is_none())
+        .filter(|p| {
+            let nome = p.nome.to_lowercase();
+            !nome.eq_ignore_ascii_case(jogo)
+                && !LAUNCHERS.contains(&nome.as_str())
+                && !fechar.iter().any(|f| f.eq_ignore_ascii_case(&nome))
+        })
+        .collect()
 }
 
 fn amostrar(p: &mut Partida, processos: &[Processo]) {
@@ -447,5 +474,32 @@ fn nome_da_prioridade(p: Prioridade) -> &'static str {
         Prioridade::Normal => "normal",
         Prioridade::AcimaDoNormal => "acima do normal",
         Prioridade::Alta => "alta",
+    }
+}
+
+#[cfg(test)]
+mod testes {
+    use super::*;
+    use crate::modo_jogo::protecao::testes::proc;
+
+    #[test]
+    fn so_apps_de_fundo_ficam_com_memoria_baixa() {
+        let lista = [
+            proc(100, 4, "explorer.exe", 1),
+            proc(200, 100, "RiotClientServices.exe", 2),
+            proc(300, 200, "VALORANT-Win64-Shipping.exe", 3),
+            proc(310, 999, "VALORANT-Win64-Shipping.exe", 3),
+            proc(400, 300, "CrashHandler.exe", 4),
+            proc(500, 100, "Discord.exe", 5),
+            proc(600, 7, "vgc.exe", 6),
+            proc(700, 100, "opera.exe", 7),
+            proc(800, 100, "steamwebhelper.exe", 8),
+            proc(900, 100, "OneDrive.exe", 9),
+        ];
+        let protecao = Protecao::nova(&lista, Some(300));
+        let fechar = ["onedrive.exe".to_owned()];
+        let alvos = apps_de_fundo(&lista, &protecao, "VALORANT-Win64-Shipping.exe", &fechar);
+        let nomes: Vec<&str> = alvos.iter().map(|p| p.nome.as_str()).collect();
+        assert_eq!(nomes, ["Discord.exe", "opera.exe"]);
     }
 }

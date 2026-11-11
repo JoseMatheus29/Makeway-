@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use eframe::egui::{self, Align, Align2, Color32, FontId, Layout, Margin, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui, pos2, vec2};
 use egui_plot::{HLine, HoverPosition, Line, LineStyle, Plot, PlotPoint, PlotPoints, Polygon, Text};
 use nucleo::formato::{decimal, duracao};
-use nucleo::modo_jogo::relatorio::{self, Amostra, RelatorioSessao};
+use nucleo::modo_jogo::relatorio::{self, Amostra, OUTRA_CONTA_PESADA, RelatorioSessao};
 use nucleo::paginacao::perto_do_limite;
 
 use super::{aviso_de_limite, partida_boa, quando, rival_da_partida, tamanho_curto};
@@ -240,6 +240,10 @@ fn detalhes(ui: &mut Ui, c: &mut Contexto, r: &RelatorioSessao, amostras: &[Amos
                     ui.label(rotulo("Próximo passo", 14.0, p.lime).family(tema::display()).extra_letter_spacing(2.2));
                     let texto = match &rival {
                         Some((exe, motivo)) => format!("O {} {motivo}. Pausado nos jogos, sobra mais para o {}.", c.dados.nome(exe), nome_do_jogo(r)),
+                        None if r.outras_contas_ram_max >= OUTRA_CONTA_PESADA => format!(
+                            "Outra conta do Windows ficou aberta e usou {} durante a partida. Sair dela antes de jogar (não só trocar de usuário) devolve essa memória.",
+                            tamanho_curto(r.outras_contas_ram_max)
+                        ),
                         None if boa => "Tudo certo: sobrou memória e processador. Nada a mudar.".to_owned(),
                         None => "Faltou memória, mas nenhum app grande pode ser pausado. Fechar abas do navegador antes de jogar ajuda.".to_owned(),
                     };

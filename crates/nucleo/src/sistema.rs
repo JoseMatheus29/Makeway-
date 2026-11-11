@@ -257,6 +257,21 @@ pub fn definir_prioridade_de_memoria(pid: u32, nivel: u32) -> io::Result<()> {
     .map_err(io::Error::from)
 }
 
+/// Nome da conta logada numa sessão do Windows ("matheus trabalho").
+/// `None` se a sessão não tiver ninguém ou o Windows não disser.
+pub fn usuario_da_sessao(sessao: u32) -> Option<String> {
+    use windows::Win32::System::RemoteDesktop::{WTSFreeMemory, WTSQuerySessionInformationW, WTSUserName};
+    let mut texto = PWSTR::null();
+    let mut bytes = 0u32;
+    // SAFETY: o Windows aloca o texto e devolve o ponteiro; liberado abaixo.
+    unsafe { WTSQuerySessionInformationW(None, sessao, WTSUserName, &mut texto, &mut bytes) }.ok()?;
+    // SAFETY: texto terminado em zero, válido até o WTSFreeMemory.
+    let nome = unsafe { texto.to_string() }.ok();
+    // SAFETY: ponteiro alocado pelo próprio WTSQuerySessionInformationW.
+    unsafe { WTSFreeMemory(texto.0 as *mut core::ffi::c_void) };
+    nome.filter(|n| !n.is_empty())
+}
+
 /// Caminho completo do .exe.
 pub fn caminho_processo(pid: u32) -> io::Result<PathBuf> {
     let h = abrir_processo(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
@@ -788,6 +803,13 @@ mod testes {
         assert_eq!(prioridade_de_memoria(eu).unwrap(), 2);
         definir_prioridade_de_memoria(eu, original).unwrap();
         assert_eq!(prioridade_de_memoria(eu).unwrap(), original);
+    }
+
+    #[test]
+    fn sabe_o_nome_da_conta_desta_sessao() {
+        let processos = listar_processos().unwrap();
+        let eu = processos.iter().find(|p| p.pid == std::process::id()).unwrap();
+        assert!(usuario_da_sessao(eu.sessao).is_some_and(|n| !n.is_empty()));
     }
 
     #[test]

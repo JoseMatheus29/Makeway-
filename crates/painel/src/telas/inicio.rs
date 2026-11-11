@@ -4,6 +4,8 @@
 use eframe::egui::{self, Align, Color32, Frame, Layout, Margin, Rect, Shape, Stroke, Ui, Vec2, pos2, vec2};
 use nucleo::config::Modo;
 use nucleo::formato::duracao;
+use nucleo::captura;
+use nucleo::modo_jogo::relatorio::OUTRA_CONTA_PESADA;
 use nucleo::paginacao::{Paginacao, perto_do_limite};
 
 use super::{Nivel, maior_app_pausavel, partida_boa, quando, rival_da_partida, tamanho_curto, veredito_da_memoria};
@@ -26,6 +28,8 @@ enum Acao {
     ComWindows,
     /// Abre as Opções de desempenho do Windows (memória virtual).
     Desempenho,
+    /// Abre uma página das Configurações do Windows.
+    Configuracoes(&'static str),
 }
 
 struct Boost {
@@ -227,6 +231,34 @@ fn cartao_partida(ui: &mut Ui, c: &mut Contexto) {
 fn montar_boosts(c: &Contexto) -> Vec<Boost> {
     let mut lista = Vec::new();
 
+    // Outra conta do Windows aberta em segundo plano, segurando memória.
+    if let Some(conta) = c.dados.ram.as_ref().and_then(|r| r.outras_contas.first()).filter(|x| x.ws_privado >= OUTRA_CONTA_PESADA) {
+        let quem = conta.usuario.as_deref().map_or("a outra conta do Windows".to_owned(), |n| format!("a conta {n}"));
+        lista.push(Boost {
+            icone: Icone::Conta,
+            titulo: format!("Sair de {quem}"),
+            texto: format!(
+                "Ela ficou aberta em segundo plano, com {} processos ocupando memória. Entre nela e use Sair (não Trocar de usuário).",
+                conta.processos
+            ),
+            ganho: format!("+{} para o jogo", tamanho_curto(conta.ws_privado)),
+            botao: "Ver",
+            acao: Acao::Ir(Tela::Memoria),
+        });
+    }
+
+    // "Gravar o que aconteceu" do Game Bar grava sem parar durante o jogo.
+    if c.dados.gravacao_do_game_bar == Some(true) {
+        lista.push(Boost {
+            icone: Icone::Gravacao,
+            titulo: "Desligar a gravação em segundo plano do Game Bar".into(),
+            texto: "\"Gravar o que aconteceu\" está ligado: o Windows grava os últimos minutos sem parar enquanto você joga. Em vídeo integrado, isso divide memória e vídeo com o jogo.".into(),
+            ganho: "Mais folga no vídeo".into(),
+            botao: "Abrir",
+            acao: Acao::Configuracoes(captura::PAGINA_DAS_CAPTURAS),
+        });
+    }
+
     // Um app para pausar: pela última partida ou, sem partidas, pela memória agora.
     let ultima = c.dados.partidas.first().map(|(_, r)| r);
     let rival = ultima.and_then(|r| rival_da_partida(c, r));
@@ -385,6 +417,7 @@ fn boosts(ui: &mut Ui, c: &mut Contexto) {
             Acao::Ir(tela) => c.ir_para = Some(*tela),
             Acao::ComWindows => c.mudar_com_windows(&ctx, true),
             Acao::Desempenho => nucleo::plataforma::abrir_opcoes_de_desempenho(),
+            Acao::Configuracoes(pagina) => nucleo::plataforma::abrir_configuracoes(pagina),
         }
     }
 }

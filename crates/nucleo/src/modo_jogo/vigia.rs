@@ -345,10 +345,13 @@ fn aplicar(sessao: &mut Sessao<AcoesWindows>, jogo: &Jogo, cfg: &Config, process
     }
 
     let protecao = Protecao::nova(processos, Some(jogo.pid));
+    // Só os apps da conta de quem está jogando. Os de outra conta aberta ao
+    // mesmo tempo ("Trocar de usuário") são de outra pessoa: nunca são mexidos.
+    let da_conta = da_conta_do_jogo(processos, jogo);
     // Antes de pausar: assim a memória que os pausados devolvem também
     // entra na lista de espera com prioridade baixa e sai antes da do jogo.
     if m.memoria_baixa_nos_apps {
-        let alvos = apps_de_fundo(processos, &protecao, &jogo.nome, &m.fechar);
+        let alvos = apps_de_fundo(&da_conta, &protecao, &jogo.nome, &m.fechar);
         match sessao.baixar_memoria(&alvos, MEMORIA_BAIXA) {
             Ok(0) => {}
             Ok(n) => feitas.push(format!("prioridade de memória baixa para {n} processos em segundo plano")),
@@ -358,7 +361,7 @@ fn aplicar(sessao: &mut Sessao<AcoesWindows>, jogo: &Jogo, cfg: &Config, process
     for (lista, fechar) in [(&m.fechar, true), (&m.pausar, false)] {
         let nomes: BTreeSet<String> = lista.iter().map(|n| n.to_lowercase()).collect();
         for nome in &nomes {
-            let alvos: Vec<&Processo> = processos.iter().filter(|p| p.nome.to_lowercase() == *nome).collect();
+            let alvos: Vec<&Processo> = da_conta.iter().copied().filter(|p| p.nome.to_lowercase() == *nome).collect();
             if let Some(motivo) = alvos.iter().find_map(|p| protecao.motivo(p)) {
                 avisos.push(format!("{nome} não foi mexido: {}", motivo.descricao()));
                 continue;
@@ -399,13 +402,24 @@ fn aplicar(sessao: &mut Sessao<AcoesWindows>, jogo: &Jogo, cfg: &Config, process
     (feitas, avisos)
 }
 
+/// Os processos da mesma sessão do Windows que o jogo. Se o jogo já fechou,
+/// nenhum.
+fn da_conta_do_jogo<'a>(processos: &'a [Processo], jogo: &Jogo) -> Vec<&'a Processo> {
+    let Some(sessao) = processos.iter().find(|p| p.pid == jogo.pid && p.criado_em == jogo.criado_em).map(|p| p.sessao)
+    else {
+        return Vec::new();
+    };
+    processos.iter().filter(|p| p.sessao == sessao).collect()
+}
+
 /// Quem fica com a prioridade de memória baixa durante o jogo: tudo o que
 /// não é protegido (Windows, serviços, anti-cheat, o jogo e o que ele
 /// abriu), nem outro processo com o nome do jogo, nem launcher ou overlay
 /// (o overlay aparece em cima do jogo), nem o que vai ser fechado.
-fn apps_de_fundo<'a>(processos: &'a [Processo], protecao: &Protecao, jogo: &str, fechar: &[String]) -> Vec<&'a Processo> {
+fn apps_de_fundo<'a>(processos: &[&'a Processo], protecao: &Protecao, jogo: &str, fechar: &[String]) -> Vec<&'a Processo> {
     processos
         .iter()
+        .copied()
         .filter(|p| protecao.motivo(p).is_none())
         .filter(|p| {
             let nome = p.nome.to_lowercase();
@@ -498,8 +512,29 @@ mod testes {
         ];
         let protecao = Protecao::nova(&lista, Some(300));
         let fechar = ["onedrive.exe".to_owned()];
-        let alvos = apps_de_fundo(&lista, &protecao, "VALORANT-Win64-Shipping.exe", &fechar);
+        let todos: Vec<&Processo> = lista.iter().collect();
+        let alvos = apps_de_fundo(&todos, &protecao, "VALORANT-Win64-Shipping.exe", &fechar);
         let nomes: Vec<&str> = alvos.iter().map(|p| p.nome.as_str()).collect();
         assert_eq!(nomes, ["Discord.exe", "opera.exe"]);
+    }
+
+    #[test]
+    fn nunca_mexe_em_apps_de_outra_conta() {
+        let mut lista = vec![
+            proc(300, 1, "jogo.exe", 3),
+            proc(500, 1, "Discord.exe", 5),
+            proc(700, 1, "OneDrive.exe", 7),
+            proc(800, 1, "OneDrive.exe", 8),
+        ];
+        for p in &mut lista {
+            p.sessao = 2;
+        }
+        lista[2].sessao = 1; // OneDrive de outra conta aberta ao mesmo tempo
+        let jogo = Jogo { pid: 300, criado_em: 3, nome: "jogo.exe".into(), caminho: None, detectado_por: String::new() };
+        let pids: Vec<u32> = da_conta_do_jogo(&lista, &jogo).iter().map(|p| p.pid).collect();
+        assert_eq!(pids, [300, 500, 800]);
+        // Jogo que já fechou: nada é mexido.
+        let fechado = Jogo { pid: 999, ..jogo };
+        assert!(da_conta_do_jogo(&lista, &fechado).is_empty());
     }
 }

@@ -69,6 +69,12 @@ pub fn ram(r: &RelatorioRam, top: usize, por_processo: bool) {
         let rotulo = format!("Outros ({} itens)", decimal(resto.len() as f64, 0));
         println!("  {:<34} {:>7} {:>14}", rotulo, "", mb(soma));
     }
+    if !por_processo {
+        for conta in &r.outras_contas {
+            let rotulo = format!("Outra conta: {}", conta.usuario.as_deref().unwrap_or("sem nome"));
+            println!("  {:<34} {:>7} {:>14}", cortar(&rotulo, 34), conta.processos, mb(conta.ws_privado));
+        }
+    }
     let total = r.total_processos();
     let rotulo = format!("Total ({} processos)", decimal(r.processos.len() as f64, 0));
     println!("  {:<34} {:>7} {:>14}", rotulo, "", mb(total));

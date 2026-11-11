@@ -89,15 +89,31 @@ pub struct App {
     pub pids: Vec<u32>,
 }
 
+/// Outra conta do Windows aberta ao mesmo tempo ("Trocar de usuário" deixa
+/// tudo dela rodando e ocupando memória).
+#[derive(Debug, Clone, Serialize)]
+pub struct OutraConta {
+    pub sessao: u32,
+    /// Nome da conta, se o Windows disser.
+    pub usuario: Option<String>,
+    pub processos: usize,
+    pub ws_privado: u64,
+    /// Memória que os processos dela reservaram (conta no limite de memória).
+    pub confirmada: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RelatorioRam {
     /// Segundos desde 1970 (UTC).
     pub instante_unix: u64,
     pub memoria: MemoriaSistema,
     pub paginacao: Vec<ArquivoPaginacao>,
-    /// Do app que mais usa RAM para o que menos usa.
+    /// Os apps desta conta e dos serviços do Windows, do que mais usa RAM
+    /// para o que menos usa. Os de outras contas ficam em `outras_contas`.
     pub apps: Vec<App>,
-    /// Do processo que mais usa RAM para o que menos usa.
+    /// Outras contas logadas, da que mais usa RAM para a que menos usa.
+    pub outras_contas: Vec<OutraConta>,
+    /// Todos os processos (de todas as contas), do que mais usa RAM para o que menos usa.
     pub processos: Vec<Processo>,
 }
 
@@ -108,18 +124,52 @@ impl RelatorioRam {
     }
 }
 
+/// Um processo de outra conta logada: nem desta sessão, nem serviço (sessão 0).
+pub fn de_outra_conta(p: &Processo, minha_sessao: u32) -> bool {
+    p.sessao != 0 && p.sessao != minha_sessao
+}
+
+/// Sessão do Windows deste programa (a da conta que está usando o PC).
+pub fn sessao_atual(processos: &[Processo]) -> Option<u32> {
+    let eu = std::process::id();
+    processos.iter().find(|p| p.pid == eu).map(|p| p.sessao)
+}
+
 /// Lê tudo do Windows e monta o relatório.
 pub fn analisar() -> io::Result<RelatorioRam> {
     let (memoria, pagina) = sistema::memoria_sistema()?;
     let paginacao = sistema::arquivos_paginacao(pagina)?;
     let mut processos = sistema::listar_processos()?;
     processos.sort_by(|a, b| b.ws_privado.cmp(&a.ws_privado).then(a.pid.cmp(&b.pid)));
-    let apps = agrupar_por_app(&processos);
+    let minha = sessao_atual(&processos).unwrap_or(0);
+    let (meus, outros): (Vec<Processo>, Vec<Processo>) =
+        processos.iter().cloned().partition(|p| !de_outra_conta(p, minha));
+    let apps = agrupar_por_app(&meus);
+    let mut outras_contas = agrupar_por_sessao(&outros);
+    for conta in &mut outras_contas {
+        conta.usuario = sistema::usuario_da_sessao(conta.sessao);
+    }
     let instante_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    Ok(RelatorioRam { instante_unix, memoria, paginacao, apps, processos })
+    Ok(RelatorioRam { instante_unix, memoria, paginacao, apps, outras_contas, processos })
+}
+
+/// Soma os processos de cada sessão (sem o nome da conta).
+pub fn agrupar_por_sessao(processos: &[Processo]) -> Vec<OutraConta> {
+    let mut por_sessao: HashMap<u32, OutraConta> = HashMap::new();
+    for p in processos {
+        let conta = por_sessao
+            .entry(p.sessao)
+            .or_insert(OutraConta { sessao: p.sessao, usuario: None, processos: 0, ws_privado: 0, confirmada: 0 });
+        conta.processos += 1;
+        conta.ws_privado += p.ws_privado;
+        conta.confirmada += p.confirmada;
+    }
+    let mut contas: Vec<OutraConta> = por_sessao.into_values().collect();
+    contas.sort_by(|a, b| b.ws_privado.cmp(&a.ws_privado).then(a.sessao.cmp(&b.sessao)));
+    contas
 }
 
 /// Memória do sistema e quanto do arquivo de paginação está em uso
@@ -206,11 +256,29 @@ mod testes {
     }
 
     #[test]
+    fn separa_outras_contas_dos_servicos_e_desta() {
+        let mut lista = [processo(1, "a.exe", 100), processo(2, "b.exe", 50), processo(3, "c.exe", 70)];
+        lista[0].sessao = 2; // esta conta
+        lista[1].sessao = 0; // serviço
+        lista[2].sessao = 1; // outra conta
+        assert!(!de_outra_conta(&lista[0], 2));
+        assert!(!de_outra_conta(&lista[1], 2));
+        assert!(de_outra_conta(&lista[2], 2));
+        let contas = agrupar_por_sessao(&lista[2..]);
+        assert_eq!(contas.len(), 1);
+        assert_eq!((contas[0].sessao, contas[0].processos, contas[0].ws_privado), (1, 1, 70 << 20));
+    }
+
+    #[test]
     fn analisa_o_sistema_real() {
         let relatorio = analisar().unwrap();
         assert!(!relatorio.apps.is_empty());
         let soma_apps: u64 = relatorio.apps.iter().map(|a| a.ws_privado).sum();
-        assert_eq!(soma_apps, relatorio.total_processos());
+        let soma_outras: u64 = relatorio.outras_contas.iter().map(|c| c.ws_privado).sum();
+        assert_eq!(soma_apps + soma_outras, relatorio.total_processos());
         assert!(relatorio.total_processos() < relatorio.memoria.total);
+        // Este processo é desta conta: nunca aparece como outra.
+        let minha = sessao_atual(&relatorio.processos).unwrap();
+        assert!(relatorio.outras_contas.iter().all(|c| c.sessao != minha && c.sessao != 0));
     }
 }

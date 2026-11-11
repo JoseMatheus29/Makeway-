@@ -3,6 +3,7 @@
 #[cfg(not(windows))]
 compile_error!("o Makeway só funciona no Windows");
 
+pub mod captura;
 pub mod config;
 pub mod disco;
 pub mod duplicados;

@@ -11,12 +11,12 @@ use eframe::egui::{
 use nucleo::formato::{decimal, mb};
 use nucleo::modo_jogo::protecao::Protecao;
 use nucleo::paginacao::{Paginacao, perto_do_limite};
-use nucleo::ram::RelatorioRam;
+use nucleo::ram::{OutraConta, RelatorioRam};
 
 use super::{Nivel, aviso_de_limite, nome_da_paginacao, tamanho_curto, veredito_da_memoria};
 use crate::app::Contexto;
 use crate::componentes::{
-    CORTE, CORTE_P, apoio, botao_secundario, brilho, cartao, cartao_com, chip, cortar, forma_cortada, forte, link,
+    CORTE, CORTE_P, apoio, botao_secundario, brilho, cartao, cartao_com, chip, cortar, faixa, forma_cortada, forte, link,
     listras, medidor_em, misturar, nota, paragrafo, rotulo, separador, texto_espacado, titulo_da_pagina,
     titulo_da_secao,
 };
@@ -61,6 +61,10 @@ impl TelaMemoria {
             ui.add_space(16.0);
             let titulo = format!("Na última partida de {}, a memória chegou perto do limite", s.jogo.trim_end_matches(".exe"));
             aviso_de_limite(ui, &titulo, s.confirmada_max, s.limite_confirmada, c.dados.paginacao);
+        }
+        for conta in &r.outras_contas {
+            ui.add_space(16.0);
+            outra_conta_aberta(ui, conta);
         }
         ui.add_space(22.0);
         self.quem_usa(ui, c, &r);
@@ -310,6 +314,41 @@ fn legenda_do_anel(ui: &mut Ui, cor: Color32, valor: &str, texto: &str) {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.label(RichText::new(valor).family(tema::display()).size(20.0).color(p.txt));
             ui.label(nota(ui, texto));
+        });
+    });
+}
+
+/// Faixa âmbar: outra conta do Windows ficou aberta e segura memória. O
+/// Makeway só explica: sair de uma conta é decisão de quem usa ela.
+fn outra_conta_aberta(ui: &mut Ui, conta: &OutraConta) {
+    let p = paleta(ui);
+    let titulo = match &conta.usuario {
+        Some(nome) => format!("Outra conta aberta: {nome}"),
+        None => "Outra conta do Windows aberta".to_owned(),
+    };
+    faixa(ui, p.aviso.gamma_multiply(0.10), |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 16.0;
+            icones::icone(ui, Icone::Conta, 26.0, p.aviso);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
+                ui.label(rotulo(&titulo, 14.0, p.aviso).family(tema::display()).extra_letter_spacing(2.2));
+                paragrafo(
+                    ui,
+                    RichText::new(format!(
+                        "{} processos: {} na RAM agora e {} reservados, que contam no limite de memória. Ela continua aberta porque alguém usou Trocar de usuário em vez de Sair.",
+                        conta.processos,
+                        tamanho_curto(conta.ws_privado),
+                        tamanho_curto(conta.confirmada)
+                    ))
+                    .size(15.0)
+                    .color(p.txt),
+                );
+                paragrafo(
+                    ui,
+                    apoio(ui, "Para devolver essa memória, entre nessa conta e escolha Sair. Pelo Gerenciador de Tarefas › Usuários também dá, mas o que estiver aberto nela fecha sem salvar. Os apps dela nunca são pausados pelo Makeway.").size(14.0),
+                );
+            });
         });
     });
 }

@@ -15,6 +15,7 @@ use nucleo::modo_jogo::relatorio::{self, RelatorioSessao};
 use nucleo::modo_jogo::vigia::{self, StatusVigia};
 use nucleo::ram::{self, RelatorioRam};
 use nucleo::temporarios::{self, AnaliseTemporarios, ResultadoLimpeza};
+use nucleo::captura;
 use nucleo::paginacao::{self, Paginacao};
 use nucleo::{inicio_automatico, nomes, plataforma};
 
@@ -74,6 +75,10 @@ pub struct Dados {
     /// Como o arquivo de paginação está configurado (relido a cada 30 s).
     pub paginacao: Option<Paginacao>,
     paginacao_em: Option<Instant>,
+    /// "Gravar o que aconteceu" do Game Bar ligado (relido a cada 10 s, para o
+    /// Boost sumir logo depois que a pessoa desligar).
+    pub gravacao_do_game_bar: Option<bool>,
+    gravacao_em: Option<Instant>,
     pub jogos: Option<Vec<JogoInstalado>>,
     tarefa_jogos: Option<Tarefa<Vec<JogoInstalado>>>,
     pub com_windows: Option<bool>,
@@ -242,6 +247,10 @@ impl Contexto {
         if d.partidas_em.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
             d.partidas = relatorio::listar(&vigia::pasta_de_relatorios(&self.pasta_dados));
             d.partidas_em = Some(Instant::now());
+        }
+        if d.gravacao_em.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
+            d.gravacao_do_game_bar = captura::gravacao_em_segundo_plano();
+            d.gravacao_em = Some(Instant::now());
         }
         if d.paginacao_em.is_none_or(|t| t.elapsed() >= Duration::from_secs(30)) {
             d.paginacao = paginacao::configuracao();

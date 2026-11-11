@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::deteccao::Jogo;
 use super::protecao::Protecao;
 use crate::formato::{decimal, tamanho};
-use crate::ram::{MemoriaSistema, Processo};
+use crate::ram::{self, MemoriaSistema, Processo};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Amostra {
@@ -59,6 +59,10 @@ pub struct RelatorioSessao {
     pub alteracoes: Vec<String>,
     pub avisos: Vec<String>,
     pub sugestoes: Vec<String>,
+    /// Maior memória somada de outras contas do Windows abertas ao mesmo
+    /// tempo ("Trocar de usuário"). Relatórios antigos não têm: 0.
+    #[serde(default)]
+    pub outras_contas_ram_max: u64,
 }
 
 /// Junta as amostras enquanto o jogo roda.
@@ -75,6 +79,7 @@ pub struct Amostrador {
     ultimo_jogo: Option<(f64, u64)>,
     ram_total: u64,
     limite_confirmada: u64,
+    outras_contas_ram_max: u64,
 }
 
 impl Amostrador {
@@ -90,6 +95,7 @@ impl Amostrador {
             ultimo_jogo: None,
             ram_total: 0,
             limite_confirmada: 0,
+            outras_contas_ram_max: 0,
         }
     }
 
@@ -101,7 +107,18 @@ impl Amostrador {
         let mut ram_jogo = 0;
         let mut cpu_jogo_pct = 0.0;
         let mut por_app: HashMap<String, (String, u64, usize)> = HashMap::new();
+        // Os apps de outra conta aberta ao mesmo tempo não são "concorrentes"
+        // que dê para pausar: entram só na soma de `outras_contas_ram_max`.
+        let sessao_do_jogo = processos
+            .iter()
+            .find(|p| p.pid == self.jogo.pid && p.criado_em == self.jogo.criado_em)
+            .map(|p| p.sessao);
+        let mut outras_contas = 0;
         for p in processos {
+            if sessao_do_jogo.is_some_and(|s| ram::de_outra_conta(p, s)) {
+                outras_contas += p.ws_privado;
+                continue;
+            }
             if p.pid == self.jogo.pid && p.criado_em == self.jogo.criado_em {
                 ram_jogo = p.ws_privado;
                 if let Some((t, cpu)) = self.ultimo_jogo {
@@ -120,6 +137,7 @@ impl Amostrador {
             app.1 += p.ws_privado;
             app.2 += 1;
         }
+        self.outras_contas_ram_max = self.outras_contas_ram_max.max(outras_contas);
         for (chave, (nome, ram, quantos)) in por_app {
             let maior = self.ram_por_app.entry(chave).or_insert((nome, 0, 0));
             maior.1 = maior.1.max(ram);
@@ -194,6 +212,7 @@ impl Amostrador {
             alteracoes,
             avisos,
             sugestoes: Vec::new(),
+            outras_contas_ram_max: self.outras_contas_ram_max,
         };
         relatorio.sugestoes = sugestoes(&relatorio, nas_listas);
         (relatorio, self.amostras)
@@ -250,8 +269,18 @@ pub fn sugestoes(r: &RelatorioSessao, nas_listas: &[String]) -> Vec<String> {
             decimal(c.cpu_media_pct, 1)
         ));
     }
+    if r.outras_contas_ram_max >= OUTRA_CONTA_PESADA {
+        lista.push(format!(
+            "Outra conta do Windows ficou aberta e usou {} durante a partida. Sair dela antes de jogar \
+             (não só trocar de usuário) devolve essa memória.",
+            tamanho(r.outras_contas_ram_max)
+        ));
+    }
     lista
 }
+
+/// A partir de quanto a memória de outra conta aberta vale um aviso.
+pub const OUTRA_CONTA_PESADA: u64 = 500 << 20;
 
 /// Grava `<data>_<jogo>.json` e `.csv` em `pasta`. Devolve o caminho do JSON.
 pub fn gravar(pasta: &Path, r: &RelatorioSessao, amostras: &[Amostra]) -> io::Result<PathBuf> {

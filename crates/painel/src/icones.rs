@@ -26,6 +26,10 @@ pub enum Icone {
     /// Botão liga/desliga.
     Energia,
     Cadeado,
+    /// Botão de gravar (bolinha cheia dentro de um círculo).
+    Gravacao,
+    /// Uma pessoa (cabeça e ombros).
+    Conta,
 }
 
 /// Desenha o ícone ocupando `rect` (quadrado).
@@ -131,6 +135,14 @@ pub fn pintar(p: &Painter, rect: Rect, icone: Icone, cor: Color32) {
                 })
                 .collect();
             linha(&arco);
+        }
+        Icone::Gravacao => {
+            circulo(12.0, 12.0, 9.0);
+            p.circle_filled(pt(12.0, 12.0), 4.0 * escala, cor);
+        }
+        Icone::Conta => {
+            circulo(12.0, 8.0, 4.0);
+            linha(&[(4.0, 21.0), (4.5, 18.0), (6.5, 15.0), (9.5, 13.6), (14.5, 13.6), (17.5, 15.0), (19.5, 18.0), (20.0, 21.0)]);
         }
         Icone::Cadeado => {
             retangulo(5.0, 11.0, 19.0, 21.0, 1.0);
